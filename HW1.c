@@ -47,17 +47,17 @@ typedef unsigned long long u64;
 #define NVAR 9                      /* number of priority orders          */
 #define MAXSH 32                    /* shapes kept (bitmask in unsigned)  */
 #ifndef OPS_LIMITV
-#define OPS_LIMITV 30000000000LL
+#define OPS_LIMITV 40000000000LL
 #endif
 #ifndef WIDE_LIMITV
 #define WIDE_LIMITV 15000000000LL   /* the wider-lookahead construction may run up to here */
 #endif
 #ifndef NORM_LIMITV
-#define NORM_LIMITV 20000000000LL
+#define NORM_LIMITV 24000000000LL
 #endif
 /*
  * The budgets are calibrated for an optimized build (-O1 and up: at most
- * about 11 s on the test machine).  Built without optimization, every unit of
+ * about 13 s on the test machine, 10.5 s on the judge).  Built without optimization, every unit of
  * work takes about 2.5 times longer, so the budgets are divided accordingly
  * (__OPTIMIZE__ is a compile-time constant of GCC and Clang).
  */
