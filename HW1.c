@@ -53,11 +53,11 @@ typedef unsigned long long u64;
 #define WIDE_LIMITV 15000000000LL   /* the wider-lookahead construction may run up to here */
 #endif
 #ifndef NORM_LIMITV
-#define NORM_LIMITV 16000000000LL
+#define NORM_LIMITV 20000000000LL
 #endif
 /*
  * The budgets are calibrated for an optimized build (-O1 and up: at most
- * about 9 s on the test machine).  Built without optimization, every unit of
+ * about 11 s on the test machine).  Built without optimization, every unit of
  * work takes about 2.5 times longer, so the budgets are divided accordingly
  * (__OPTIMIZE__ is a compile-time constant of GCC and Clang).
  */
