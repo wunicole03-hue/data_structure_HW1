@@ -1091,6 +1091,19 @@ static int try_option_shapes(User *u, int oi, unsigned allowed, int *used)
         *used = s;
         return 1;
     }
+#ifndef DRY_FILTER
+#define DRY_FILTER 1
+#endif
+    if (DRY_FILTER && k > 1) {
+        /* shapes whose first fit (dry run, nothing marked) cannot hold all k
+           RBs are left out: a failed placement costs far more than this test */
+        unsigned keep = 0;
+        int ex;
+        for (s = 0; s < nsh; s++)
+            if (((allowed >> s) & 1U) && dry_count(s, good, a, d, k, &ex) >= k) keep |= 1U << s;
+        if (!keep) return 0;
+        allowed = keep;
+    }
     for (s = 0; s < nsh; s++) scanFrom[s] = a;
 
     for (j = 0; j < k; j++) {
@@ -1114,11 +1127,20 @@ static int try_option_shapes(User *u, int oi, unsigned allowed, int *used)
     return 1;
 }
 
+#ifdef DIAG
+long long dgTryOps[3], dgTryCnt[3];
+#endif
 static int try_option(User *u, int oi)
 {
     unsigned allowed = u->optShapes[oi];
     while (allowed) {
+#ifdef DIAG
+        long long o0 = ops;
         int used = -1, r = try_option_shapes(u, oi, allowed, &used);
+        dgTryOps[r] += ops - o0; dgTryCnt[r]++;
+#else
+        int used = -1, r = try_option_shapes(u, oi, allowed, &used);
+#endif
         if (r == 1) return 1;
         if (r == 0 || used < 0) return 0;
         allowed &= ~(1U << used);       /* that shape could not hold all RBs */
@@ -1776,6 +1798,9 @@ static void rebuild_ulist(int v)
     }
     ops += (long long)i * 24 + 16;      /* random access into U: cache misses */
 }
+#ifndef REG_USERS
+#define REG_USERS 256               /* largest region: about this many average requests */
+#endif
 #ifndef LNS_EXTRA
 #define LNS_EXTRA 24                /* refill candidates: the removed requests and this many more */
 #endif
@@ -1821,10 +1846,13 @@ static double cpu_now(void)
 
 /* called after every local search step: moves the end of the budget so that
    the search stops at TIME_LNS */
+static long long allProfit = -1;    /* profit of every request that has an option */
+
 static void lns_clock(void)
 {
     double t, rate;
     long long e;
+    if (curProfit >= allProfit && allProfit >= 0) { opsEnd = ops; return; }   /* everybody is served */
     if (!timeOn || ops - chkOps < chkGap) return;
     chkOps = ops;
     t = cpu_now();
@@ -3166,6 +3194,8 @@ int main(void)
         if (wideRest > rest) wideRest = rest;
         wideEnd = base + wideRest;
         hardLimit = base + rest + (OPS_HARD - OPS_LIMIT);
+        allProfit = 0;
+        for (i = 0; i < N; i++) if (U[i].nopt + U[i].nbig > 0) allProfit += U[i].profit;
         ownLive = 0;                            /* only the local search needs owners */
         ownValid = 0;
         double tPrev = 0;               /* CPU seconds of the last construction */
@@ -3203,6 +3233,7 @@ int main(void)
                 if (ci + 1 < nCfg) save_snapshot();
             }
             if (!r) break;                      /* out of budget */
+            if (curProfit >= allProfit) break;  /* everybody is served */
         }
         /* a local search follows if work budget (or, with the clock, time) is left */
         lnsWill = timeOn ? cpu_now() < TIME_LNS - 0.2 : ops < normEnd;
@@ -3243,16 +3274,24 @@ int main(void)
         }
         if (ops < opsEnd)
         {
-            int widths[8], nw = 0, cycle = 0, vc = 0;
+            int widths[10], nw = 0, cycle = 0, vc = 0;
             long long sumL = 0, cntL = 0, Lavg;
             for (i = 0; i < N; i++) if (U[i].nopt) { sumL += U[i].dl - U[i].arr + 1; cntL++; }
             Lavg = cntL ? sumL / cntL : X;
             {
-                long long cand[6];
-                int c;
+                long long cand[8], nAs = 0, maxW;
+                int c, nc0;
+                /* a full-height strip holds at most about REG_USERS average requests */
+                for (i = 0; i < N; i++) nAs += U[i].assigned;
+                maxW = nAs > 0 ? (long long)((double)REG_USERS * ((double)curArea / (double)nAs) / (double)Y) : X;
+                if (maxW < 2LL * S) maxW = 2LL * S;
+                ops += N;
                 cand[0] = Lavg / 8; cand[1] = Lavg / 4; cand[2] = Lavg / 2;
                 cand[3] = Lavg; cand[4] = 2LL * S; cand[5] = S;
-                for (c = 0; c < 6; c++) {
+                cand[6] = maxW / 4; cand[7] = maxW / 2;     /* only if some width was cut */
+                nc0 = 6;
+                for (c = 0; c < 6; c++) if (cand[c] > maxW) { cand[c] = maxW; nc0 = 8; }
+                for (c = 0; c < nc0; c++) {
                     long long w = cand[c];
                     int dup = 0, q2;
                     if (w < 2) w = 2;
@@ -3266,6 +3305,7 @@ int main(void)
                 lnsStart = ops;
                 lastImpOps = ops; lastImpStep = lnsSteps;
                 lnsStall = (opsEnd - lnsStart) / LDS_STALL;
+
                 if (timeOn) { lnsT0 = cpu_now(); lnsOps0 = ops; chkOps = ops; }
             if (ADAPT) cls_init(widths, nw);
             for (;;) {
@@ -3314,6 +3354,11 @@ int main(void)
     }
 
 #ifdef DIAG
+    {
+        extern long long dgTryOps[3], dgTryCnt[3];
+        fprintf(stderr, "  try: fail0 %lld calls %.3g ops | ok %lld calls %.3g ops | partial %lld calls %.3g ops\n",
+                dgTryCnt[0], (double)dgTryOps[0], dgTryCnt[1], (double)dgTryOps[1], dgTryCnt[2], (double)dgTryOps[2]);
+    }
     {
         int c;
         extern long long dgClsOps[64], dgClsSteps[64], dgClsGain[64];
