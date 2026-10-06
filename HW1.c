@@ -1,7 +1,7 @@
 /*
  * Programming Project #1 : 2D Resource Allocation Problem with NR
  *
- * Approach (fully deterministic, no randomness, no timing functions):
+ * Approach:
  *   1. For every user, precompute "options": a bit threshold b gives the
  *      usable rows (bits >= b) and the number of RBs k = ceil(D / (S*b)).
  *      Dominated options are dropped, so options are sorted by k ascending.
@@ -11,7 +11,8 @@
  *      looks ahead a bounded distance and keeps the corner position with the
  *      highest contact ratio (touching occupied cells / borders);
  *      all RBs of one request use the same shape (safe numerology rule).
- *      Free space is tested with OR-levels over columns (row bitmasks).
+ *      A dry first-fit run (nothing marked) first drops the shapes that
+ *      cannot hold all k RBs, so few placements fail half way.
  *      Cheap mode (used when the work budget cannot afford the lookahead for
  *      every request): first fit found by a dry run that does not touch the
  *      grid, and the request's RBs merged into a few rectangles that are
@@ -20,17 +21,23 @@
  *   3. Initial solution: greedy over several priority orders
  *      (profit / area^alpha), keep the best.  When the demand is several
  *      times the grid, the leading requests that fill it get a long
- *      lookahead (they decide the profit; the rest mostly fail).  Options needing more than
- *      MAX_RB RBs are separate items: each is tried (cheap mode) when the
- *      greedy reaches its own profit per area.
- *   4. Improvement: deterministic ruin-and-recreate.  Time strips and row
- *      bands of various sizes are swept systematically; all users inside a
- *      region are removed and the region is refilled by priority
- *      (removed + unassigned users).  A move is kept if profit increases,
- *      or stays equal with less used area.  Once the search stalls, each
- *      refill also tries leaving out one of the requests it placed (one
- *      discrepancy), so that others may fit instead.
- *   All work is bounded by an operation counter, not by a clock.
+ *      lookahead (they decide the profit; the rest mostly fail).  Options
+ *      needing more than MAX_RB RBs are separate items: each is tried (cheap
+ *      mode) when the greedy reaches its own profit per area.
+ *   4. Improvement: ruin-and-recreate.  All users inside a region (time strip
+ *      x row band) are removed and the region is refilled by priority
+ *      (removed + unassigned users).  A move is kept if profit increases, or
+ *      stays equal with less used area.  Region shapes are swept with one
+ *      cursor each, and each short segment of work goes to a shape chosen in
+ *      proportion to its recent gain.  Once the sweep stalls, each refill also
+ *      tries leaving out one of the requests it placed (one discrepancy);
+ *      when that stalls too, a randomized phase follows (random regions,
+ *      noisy refill order, annealing on the profit; best solution kept).
+ *      The generator has a fixed seed.
+ *   Time: planning uses an operation counter; the local search ends on the
+ *   processor clock (TIME_LNS seconds, limit 15 s), so heavy inputs cannot run
+ *   long and light ones use the time.  Results can therefore differ slightly
+ *   between runs.  Compile with -DNO_CLOCK for a fixed, repeatable budget.
  *   No input range is assumed: every array is sized from the input.
  */
 #include <stdio.h>
@@ -1142,20 +1149,11 @@ static int try_option_shapes(User *u, int oi, unsigned allowed, int *used)
     return 1;
 }
 
-#ifdef DIAG
-long long dgTryOps[3], dgTryCnt[3];
-#endif
 static int try_option(User *u, int oi)
 {
     unsigned allowed = u->optShapes[oi];
     while (allowed) {
-#ifdef DIAG
-        long long o0 = ops;
         int used = -1, r = try_option_shapes(u, oi, allowed, &used);
-        dgTryOps[r] += ops - o0; dgTryCnt[r]++;
-#else
-        int used = -1, r = try_option_shapes(u, oi, allowed, &used);
-#endif
         if (r == 1) return 1;
         if (r == 0 || used < 0) return 0;
         allowed &= ~(1U << used);       /* that shape could not hold all RBs */
@@ -1308,10 +1306,6 @@ static void unassign_batch(const int *ids, int n)
 {
     size_t ns = 0, a, m;
     int i, r, s;
-#if defined(NO_BATCH)
-    for (i = 0; i < n; i++) unassign(&U[ids[i]]);
-    return;
-#endif
     for (i = 0; i < n; i++) ns += (size_t)U[ids[i]].nrb;
     if (ns > spanCap) {
         size_t nc = ns * 2 + 64;
@@ -1822,6 +1816,9 @@ static void rebuild_ulist(int v)
 #ifndef LNS_EXTRA
 #define LNS_EXTRA 24                /* refill candidates: the removed requests and this many more */
 #endif
+#ifndef SA_EXTRA
+#define SA_EXTRA 24                 /* the same in the randomized phase */
+#endif
 #ifndef LDS_STALL
 #define LDS_STALL 10                /* no gain for 1/LDS_STALL of the search budget: stalled */
 #endif
@@ -1949,35 +1946,12 @@ static void stalled(void)
 
 #ifdef DIAG
 long long dgSteps, dgNr, dgNc, dgNa, dgImp, dgEq, dgWorse;
-int dgCls = 0;                      /* region class of the current step */
-long long dgClsOps[64], dgClsSteps[64], dgClsGain[64], dgClsNr[64];
 #endif
-static int lns_step_(int t0, int t1, int v);
 static int lns_step(int t0, int t1, int v)
-{
-#ifdef DIAG
-    long long o0 = ops, p0 = curProfit;
-    int r = lns_step_(t0, t1, v);
-    dgClsOps[dgCls] += ops - o0; dgClsSteps[dgCls]++; dgClsGain[dgCls] += curProfit - p0;
-    return r;
-#else
-    return lns_step_(t0, t1, v);
-#endif
-}
-#ifdef DIAG_T
-double dtRem, dtCand, dtFill, dtUndo;
-#define TPROBE(var) do { double _t = cpu_now(); var += _t - _tp; _tp = _t; } while (0)
-#else
-#define TPROBE(var) do { } while (0)
-#endif
-static int lns_step_(int t0, int t1, int v)
 {
     long long oldP = curProfit, oldA = curArea;
     int nr = 0, nc = 0, na = 0, i, j, lim, hi;
     size_t pu = 0;
-#ifdef DIAG_T
-    double _tp = cpu_now();
-#endif
 
     /* users with arrival <= t1 form a prefix when arrivals are sorted */
     {
@@ -2020,8 +1994,7 @@ static int lns_step_(int t0, int t1, int v)
         candList[nc++] = remList[i];
     }
     unassign_batch(remList, nr);
-    TPROBE(dtRem);
-    lim = nr + LNS_EXTRA;
+    lim = nr + (saOn ? SA_EXTRA : LNS_EXTRA);
     if (!unsortedArr) {
         /* users that can intersect [t0, t1] have arrival in [t0 - maxWin, t1] */
         int lo = 0, h2 = N;
@@ -2082,7 +2055,6 @@ static int lns_step_(int t0, int t1, int v)
     }
     ops += 64;
     lnsSteps++;
-    TPROBE(dtCand);
     for (i = 0; i < nr; i++) inRem[remList[i]] = 0;
     curVar = v;
     if (saOn && saBuf) {
@@ -2097,7 +2069,6 @@ static int lns_step_(int t0, int t1, int v)
     } else qsort(candList, (size_t)nc, sizeof(int), cmp_rank);
     for (i = 0; i < nc && ops <= hardLimit; i++)
         if (place_user(&U[candList[i]])) addList[na++] = candList[i];
-    TPROBE(dtFill);
 
 #ifdef DIAG
     {
@@ -2148,7 +2119,6 @@ static int lns_step_(int t0, int t1, int v)
         curOwner = remList[i];
         for (j = 0; j < u->nrb; j++) mark_rb(&u->rbs[j], 1);
     }
-    TPROBE(dtUndo);
     return 0;
 }
 
@@ -2887,6 +2857,9 @@ static int sa_run(const int *widths, int nw)
 #endif
     }
     if (!bestIsCur && snapP >= 0) snapOut = 1;      /* answer: the best solution seen */
+#ifdef DIAG
+    fprintf(stderr, "  sa end: current %lld best %lld snapOut %d\n", curProfit, bestP, snapOut);
+#endif
     return 1;
 }
 
@@ -2897,9 +2870,6 @@ static int sa_run(const int *widths, int nw)
  * each segment goes to a class chosen in proportion to the profit it gained
  * per unit of work recently (every class keeps a small share).
  */
-#ifndef ADAPT
-#define ADAPT 1
-#endif
 #ifndef SEG_DIV
 #define SEG_DIV 200                 /* a segment is about 1/SEG_DIV of the search budget */
 #endif
@@ -2985,9 +2955,6 @@ static void lns_sweep(int *vc)
         double r;
         if (seg < 2000000) seg = 2000000;
         do {
-#ifdef DIAG
-            { extern int dgCls; dgCls = c->mode * 8 + (int)(ci % 8); }
-#endif
             cls_step(c, (*vc)++ % nv);
             lns_clock();
 #ifdef DIAG
@@ -3310,7 +3277,7 @@ int main(void)
         }
         if (ops < opsEnd)
         {
-            int widths[10], nw = 0, cycle = 0, vc = 0;
+            int widths[10], nw = 0, vc = 0;
             long long sumL = 0, cntL = 0, Lavg;
             for (i = 0; i < N; i++) if (U[i].nopt) { sumL += U[i].dl - U[i].arr + 1; cntL++; }
             Lavg = cntL ? sumL / cntL : X;
@@ -3338,77 +3305,20 @@ int main(void)
                 }
                 qsort(widths, (size_t)nw, sizeof(int), cmp_int);
             }
-            {
-                lnsStart = ops;
-                lastImpOps = ops; lastImpStep = lnsSteps;
-                lnsStall = (opsEnd - lnsStart) / LDS_STALL;
-
-                if (timeOn) { lnsT0 = cpu_now(); lnsOps0 = ops; chkOps = ops; }
-            if (ADAPT) cls_init(widths, nw);
+            lnsStart = ops;
+            lastImpOps = ops; lastImpStep = lnsSteps;
+            lnsStall = (opsEnd - lnsStart) / LDS_STALL;
+            if (timeOn) { lnsT0 = cpu_now(); lnsOps0 = ops; chkOps = ops; }
+            cls_init(widths, nw);
             for (;;) {
-            if (ADAPT) lns_sweep(&vc);
-            while (!ADAPT && ops < opsEnd && !saOn) {
-                int wi, mode = cycle % 3;
-                int hb = (int)(((long long)Y + (1LL << mode) - 1) >> mode);   /* Y, Y/2, Y/4, ... */
-                int rstep = hb / 2 > 0 ? hb / 2 : 1;
-                long long r0;
-                if (is_stalled()) stalled();
-                if (mode > 0 && hb >= Y) { cycle++; continue; }
-                for (wi = 0; wi < nw && ops < opsEnd && !saOn; wi++) {
-                    long long wd = (long long)widths[wi] * (mode ? 2 : 1), step, off, t0;
-                    if (wd > X) wd = X;
-                    step = wd / 2 > 0 ? wd / 2 : 1;
-                    off = ((long long)(cycle / 3) * step / 3) % step;
-                    for (t0 = off - step; t0 < X && ops < opsEnd && !saOn; t0 += step) {
-                        long long s0 = t0 < 0 ? 0 : t0, s1 = t0 + wd - 1;
-                        if (s1 > X - 1) s1 = X - 1;
-                        if (s1 < s0) continue;
-                        for (r0 = 0; r0 < Y && ops < opsEnd && !saOn; r0 += (mode ? rstep : Y)) {
-                            ry0 = mode ? (int)r0 : 0;
-                            ry1 = mode ? (int)(r0 + hb - 1 < Y - 1 ? r0 + hb - 1 : Y - 1) : Y - 1;
-#ifdef DIAG
-                            { extern int dgCls; dgCls = mode * 8 + wi; }
-#endif
-                            lns_step((int)s0, (int)s1, vc % (nVar < NVAR_LNS ? nVar : NVAR_LNS));
-                            lns_clock();
-                            vc++;
-#ifdef DIAG
-                            lns_trace(lnsStart, cycle);
-#endif
-                            if (is_stalled()) stalled();
-                            if (mode && r0 + hb >= Y) break;
-                        }
-                    }
-                }
-                cycle++;
-            }
-            if (!saOn || ops >= opsEnd) break;
-            if (sa_run(widths, nw)) break;
-            saOn = 0; saAllowed = 0; ldsOn = 1;   /* could not start: back to the sweep */
-            }
+                lns_sweep(&vc);
+                if (!saOn || ops >= opsEnd) break;
+                if (sa_run(widths, nw)) break;
+                saOn = 0; saAllowed = 0;        /* could not start: back to the sweep */
             }
         }
     }
 
-#ifdef DIAG_T
-    {
-        extern double dtRem, dtCand, dtFill, dtUndo;
-        fprintf(stderr, "  time: remove %.2fs candidates %.2fs refill %.2fs undo %.2fs\n", dtRem, dtCand, dtFill, dtUndo);
-    }
-#endif
-#ifdef DIAG
-    {
-        extern long long dgTryOps[3], dgTryCnt[3];
-        fprintf(stderr, "  try: fail0 %lld calls %.3g ops | ok %lld calls %.3g ops | partial %lld calls %.3g ops\n",
-                dgTryCnt[0], (double)dgTryOps[0], dgTryCnt[1], (double)dgTryOps[1], dgTryCnt[2], (double)dgTryOps[2]);
-    }
-    {
-        int c;
-        extern long long dgClsOps[64], dgClsSteps[64], dgClsGain[64];
-        for (c = 0; c < 64; c++) if (dgClsSteps[c])
-            fprintf(stderr, "  class mode=%d wi=%d steps=%lld ops=%.3g gain=%lld gain/Gops=%.1f\n", c / 8, c % 8, dgClsSteps[c], (double)dgClsOps[c], dgClsGain[c], dgClsGain[c] / (dgClsOps[c] / 1e9));
-    }
-#endif
     /* 3. output (sorted by user id; hand-formatted, buffered) */
     {
         int na = 0, sorted = 1;
