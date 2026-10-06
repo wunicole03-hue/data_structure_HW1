@@ -38,10 +38,6 @@
  *   operation counter whose costs follow the measured run time.
  *   No input range is assumed: every array is sized from the input.
  */
-/* hardware population count on x86-64 (every such CPU since about 2008 has it) */
-#if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__)
-#pragma GCC target("popcnt")
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,19 +53,9 @@ typedef unsigned long long u64;
 #define WIDE_LIMITV 15000000000LL   /* the wider-lookahead construction may run up to here */
 #endif
 #ifndef NORM_LIMITV
-#define NORM_LIMITV 28000000000LL
+#define NORM_LIMITV 24000000000LL
 #endif
-/*
- * The budgets are calibrated for an optimized build (-O1 and up: at most
- * about 12.5 s on the judge).  Built without optimization, every unit of
- * work takes about 2.5 times longer, so the budgets are divided accordingly
- * (__OPTIMIZE__ is a compile-time constant of GCC and Clang).
- */
-#if defined(__GNUC__) && !defined(__OPTIMIZE__)
-#define BUDGET(v) ((v) / 5 * 2)
-#else
 #define BUDGET(v) (v)
-#endif
 #define NORM_LIMIT BUDGET(NORM_LIMITV)
 #define OPS_LIMIT BUDGET(OPS_LIMITV)      /* soft work budget                   */
 #define OPS_HARD  (OPS_LIMIT + BUDGET(1100000000LL))      /* hard work budget                   */
@@ -262,9 +248,6 @@ static int ilog2(long long v)
 /* ---------- multi-word row-mask helpers ---------- */
 
 
-#if defined(__GNUC__) && !defined(NO_BUILTIN)
-#define ctz64(v) __builtin_ctzll(v)  /* index of lowest set bit, v != 0 */
-#else
 static const int debruijnTab[64] = {
     0, 1, 48, 2, 57, 49, 28, 3, 61, 58, 50, 42, 38, 29, 17, 4,
     62, 55, 59, 36, 53, 51, 43, 22, 45, 39, 33, 30, 24, 18, 12, 5,
@@ -275,18 +258,13 @@ static int ctz64(u64 v)     /* index of lowest set bit, v != 0 */
 {
     return debruijnTab[((v & (0 - v)) * 0x03F79D71B4CB0A89ULL) >> 58];
 }
-#endif
 
-static int popc(u64 v)      /* number of set bits */
+static int popc(u64 v)      /* number of set bits (portable) */
 {
-#if defined(__GNUC__)
-    return __builtin_popcountll(v);
-#else
     v = v - ((v >> 1) & 0x5555555555555555ULL);
     v = (v & 0x3333333333333333ULL) + ((v >> 2) & 0x3333333333333333ULL);
     v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
     return (int)((v * 0x0101010101010101ULL) >> 56);
-#endif
 }
 
 static void shr_k(u64 *d, const u64 *s, int k)   /* bit y of d = bit y+k of s */
