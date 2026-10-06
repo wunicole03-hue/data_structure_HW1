@@ -56,7 +56,9 @@ typedef unsigned long long u64;
 #define OPS_HARD  (OPS_LIMIT + 1100000000LL)      /* hard work budget                   */
 #define MEM_GRID  900000000.0
 #define MAX_COLS  30000000LL        /* most columns the grid keeps */      /* bytes allowed for the grid levels  */
+#ifndef MAX_RB
 #define MAX_RB    64                 /* max RBs per user in the normal passes */
+#endif
 #ifndef BIG_RB
 #define BIG_RB    1048576            /* requests needing more: separate items, at their own profit per area */
 #endif
@@ -290,6 +292,19 @@ static void runs(u64 *d, const u64 *f, int h)
         for (i = 0; i < W; i++) d[i] &= scT[i];
         len += step;
     }
+}
+
+/* runs() for the height of shape s (one word: the precomputed shifts) */
+static void runs_s(u64 *d, const u64 *f, int s)
+{
+    if (W == 1) {
+        u64 v = f[0];
+        int t;
+        for (t = 0; t < shNStep[s]; t++) v &= v >> shStep[s][t];
+        d[0] = v;
+        return;
+    }
+    runs(d, f, shH[s]);
 }
 
 static int is_zero(const u64 *a)
@@ -737,7 +752,7 @@ static void scan_shape_core(int s, const u64 *good, int a, int a0, int d, Best *
     int w = shW[s], xmax = d - w + 1, first = -1, x, i, wi, we;
     long long look = (long long)lookMul * w, lim = xmax, visits = 0;
     u64 z;
-    runs(scGs, good, shH[s]);               /* user's row pattern for this shape */
+    runs_s(scGs, good, s);                  /* user's row pattern for this shape */
     if (is_zero(scGs) || a0 > xmax) { *firstOut = first; return; }
     wi = a0 >> 6; we = xmax >> 6;
     z = fz[s][wi] & (~0ULL << (a0 & 63));
@@ -843,7 +858,7 @@ static int dry_count(int s, const u64 *good, int a, int d, int k, int *exact)
     long long visits = 0, work = 0;
     u64 z;
     *exact = 1;
-    runs(scGs, good, h);
+    runs_s(scGs, good, s);
     ops += (long long)(ilog2(h) + 2) * W + 8;
 #ifdef LEAN_STATS
     dryOps += (long long)(ilog2(h) + 2) * W + 8;
@@ -1163,7 +1178,7 @@ static int probe_option(const User *u, int oi)
         if (!((u->optShapes[oi] >> s) & 1U)) continue;
         if ((shDirty >> s) & 1U) continue;      /* stale: the cheap mode does not use it */
         if (a > xmax) continue;
-        runs(scGs, good, shH[s]);
+        runs_s(scGs, good, s);
         ops += W * 2 + 2;
         wi = a >> 6; we = xmax >> 6;
         z = fz[s][wi] & (~0ULL << (a & 63));
@@ -1780,9 +1795,12 @@ static int intersects(const User *u, int t0, int t1)
 
 /* returns 1 if a strictly better state was reached */
 static int *ulist[NVAR], ulen[NVAR];   /* unassigned users per priority order */
-static long long maxWin;
+static long long maxWin, lnsLavg = 1;   /* longest / average request window */
 static long long lnsSteps;
 
+#ifndef ULIST_AGE
+#define ULIST_AGE (512 + N / 200)        /* refills between rebuilds of an unassigned list */
+#endif
 static long long ulistAgeV[NVAR];
 static int ulistInit;
 
@@ -1828,7 +1846,7 @@ static long long lastImpStep, passSteps = -1;   /* steps: at the last gain, in o
 #define TIME_LNS 10.0               /* CPU seconds: the local search ends here     */
 #endif
 #ifndef TIME_CONS
-#define TIME_CONS 6.5               /* CPU seconds: no extra construction past this */
+#define TIME_CONS 8.0               /* CPU seconds: no extra construction past this */
 #endif
 #ifndef TIME_FIRST
 #define TIME_FIRST 9.0              /* CPU seconds: even the first construction stops */
@@ -1946,11 +1964,20 @@ static int lns_step(int t0, int t1, int v)
     return lns_step_(t0, t1, v);
 #endif
 }
+#ifdef DIAG_T
+double dtRem, dtCand, dtFill, dtUndo;
+#define TPROBE(var) do { double _t = cpu_now(); var += _t - _tp; _tp = _t; } while (0)
+#else
+#define TPROBE(var) do { } while (0)
+#endif
 static int lns_step_(int t0, int t1, int v)
 {
     long long oldP = curProfit, oldA = curArea;
     int nr = 0, nc = 0, na = 0, i, j, lim, hi;
     size_t pu = 0;
+#ifdef DIAG_T
+    double _tp = cpu_now();
+#endif
 
     /* users with arrival <= t1 form a prefix when arrivals are sorted */
     {
@@ -1993,13 +2020,16 @@ static int lns_step_(int t0, int t1, int v)
         candList[nc++] = remList[i];
     }
     unassign_batch(remList, nr);
+    TPROBE(dtRem);
     lim = nr + LNS_EXTRA;
     if (!unsortedArr) {
         /* users that can intersect [t0, t1] have arrival in [t0 - maxWin, t1] */
         int lo = 0, h2 = N;
         long long from = (long long)t0 - maxWin;
         while (lo < h2) { int md = lo + (h2 - lo) / 2; if (U[md].arr < from) lo = md + 1; else h2 = md; }
-        if (hi - lo <= 40 * lim + 2000) {
+        /* scan the arrival range (sequential) unless walking the unassigned list
+           (random access; about one in X / (region + window) entries fits) is cheaper */
+        if ((double)(hi - lo) <= 8.0 * lim * (double)X / ((double)(t1 - t0 + 1) + (double)lnsLavg) + 2000.0) {
             int base = nc;
             for (i = lo; i < hi; i++) {
                 User *u = &U[i];
@@ -2038,7 +2068,7 @@ static int lns_step_(int t0, int t1, int v)
         /* walk the cached unassigned list of this priority order */
         int *ul;
         if (!ulistInit) { int v2; for (v2 = 0; v2 < NVAR; v2++) ulistAgeV[v2] = -1; ulistInit = 1; }
-        if (ulistAgeV[v] < 0 || lnsSteps - ulistAgeV[v] >= 512 + N / 2000) { rebuild_ulist(v); ulistAgeV[v] = lnsSteps; }
+        if (ulistAgeV[v] < 0 || lnsSteps - ulistAgeV[v] >= ULIST_AGE) { rebuild_ulist(v); ulistAgeV[v] = lnsSteps; }
         ul = ulist[v];
         for (i = 0; i < ulen[v] && lim > 0; i++) {
             int id = ul[i];
@@ -2052,6 +2082,7 @@ static int lns_step_(int t0, int t1, int v)
     }
     ops += 64;
     lnsSteps++;
+    TPROBE(dtCand);
     for (i = 0; i < nr; i++) inRem[remList[i]] = 0;
     curVar = v;
     if (saOn && saBuf) {
@@ -2066,6 +2097,7 @@ static int lns_step_(int t0, int t1, int v)
     } else qsort(candList, (size_t)nc, sizeof(int), cmp_rank);
     for (i = 0; i < nc && ops <= hardLimit; i++)
         if (place_user(&U[candList[i]])) addList[na++] = candList[i];
+    TPROBE(dtFill);
 
 #ifdef DIAG
     {
@@ -2116,6 +2148,7 @@ static int lns_step_(int t0, int t1, int v)
         curOwner = remList[i];
         for (j = 0; j < u->nrb; j++) mark_rb(&u->rbs[j], 1);
     }
+    TPROBE(dtUndo);
     return 0;
 }
 
@@ -2800,7 +2833,7 @@ static void lns_trace(long long lnsStart, int cycle)
 #define SA_T1 0.003     /* final temperature, same unit */
 #endif
 #ifndef SA_NOISE
-#define SA_NOISE 0.5    /* most noise added to log(profit / area^alpha) */
+#define SA_NOISE 1.0    /* most noise added to log(profit / area^alpha) */
 #endif
 
 /*
@@ -3207,6 +3240,9 @@ int main(void)
             consLimit = ci == 0 ? TIME_FIRST : TIME_CONS;
             if (ci == 1 && (!switched || !cpValid || ops + cpTot * 12 / 10 > gEnd)) continue;
             if (ci == 2 && longWhole) continue;   /* the first one already had the long lookahead */
+#ifdef NO_WIDE
+            if (ci >= 2) break;
+#endif
             if (ci == 2) {
                 /* the widest lookahead whose cost (measured ratios to lookahead 4,
                    with a margin) still fits */
@@ -3223,7 +3259,7 @@ int main(void)
             r = greedy(0, (ci == 2 ? wideEnd : ci == 3 ? normEnd : gEnd) - ops, cfgMode[ci]);
             if (ci == 0) switched = greedySwitched;
 #ifdef DIAG
-            fprintf(stderr, "  config %d look=%d mode=%d complete=%d switched=%d profit=%lld cost=%.3g ops=%.3g\n", ci, cfgL[ci], cfgMode[ci], r, greedySwitched, curProfit, (double)(ops - st), (double)ops);
+            fprintf(stderr, "  config %d look=%d mode=%d complete=%d switched=%d profit=%lld cost=%.3g ops=%.3g cpu=%.2fs\n", ci, cfgL[ci], cfgMode[ci], r, greedySwitched, curProfit, (double)(ops - st), (double)ops, cpu_now());
 #endif
             prevCost = ops - st;
             if (timeOn) tPrev = cpu_now() - tNow;
@@ -3278,6 +3314,7 @@ int main(void)
             long long sumL = 0, cntL = 0, Lavg;
             for (i = 0; i < N; i++) if (U[i].nopt) { sumL += U[i].dl - U[i].arr + 1; cntL++; }
             Lavg = cntL ? sumL / cntL : X;
+            lnsLavg = Lavg > 0 ? Lavg : 1;
             {
                 long long cand[8], nAs = 0, maxW;
                 int c, nc0;
@@ -3353,6 +3390,12 @@ int main(void)
         }
     }
 
+#ifdef DIAG_T
+    {
+        extern double dtRem, dtCand, dtFill, dtUndo;
+        fprintf(stderr, "  time: remove %.2fs candidates %.2fs refill %.2fs undo %.2fs\n", dtRem, dtCand, dtFill, dtUndo);
+    }
+#endif
 #ifdef DIAG
     {
         extern long long dgTryOps[3], dgTryCnt[3];
