@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef unsigned long long u64;
 
@@ -53,7 +54,7 @@ typedef unsigned long long u64;
 #define NORM_LIMIT NORM_LIMITV
 #define OPS_LIMIT OPS_LIMITV      /* soft work budget                   */
 #define OPS_HARD  (OPS_LIMIT + 1100000000LL)      /* hard work budget                   */
-#define MEM_GRID  1200000000.0
+#define MEM_GRID  900000000.0
 #define MAX_COLS  30000000LL        /* most columns the grid keeps */      /* bytes allowed for the grid levels  */
 #define MAX_RB    64                 /* max RBs per user in the normal passes */
 #ifndef BIG_RB
@@ -96,6 +97,9 @@ typedef unsigned long long u64;
 #define LOOK_MULV 4
 #endif
 #define LOOK_MUL  LOOK_MULV                /* lookahead (in RB widths) after the first fit */
+#ifndef LNS_LOOK
+#define LNS_LOOK LOOK_MUL           /* lookahead of the local search refills */
+#endif
 static long long lookMul = LOOK_MUL;
 #define MEM_OWN   500000000.0       /* bytes allowed for the owner grid   */
 #define MEM_ROW   300000000.0       /* bytes allowed for row-major occupancy */
@@ -1255,6 +1259,59 @@ static void unassign(User *u)
     curArea -= (long long)u->nrb * S;
 }
 
+/*
+ * Take back every RB of the requests ids[0..n-1] at once: the cells are
+ * cleared first, then the free-start masks are rebuilt once per merged
+ * column span (instead of once per RB and shape).
+ */
+static long long *spanLo, *spanHi;
+static size_t spanCap;
+
+static void unassign_batch(const int *ids, int n)
+{
+    size_t ns = 0, a, m;
+    int i, r, s;
+#if defined(NO_BATCH)
+    for (i = 0; i < n; i++) unassign(&U[ids[i]]);
+    return;
+#endif
+    for (i = 0; i < n; i++) ns += (size_t)U[ids[i]].nrb;
+    if (ns > spanCap) {
+        size_t nc = ns * 2 + 64;
+        long long *p1 = (long long *)realloc(spanLo, sizeof(long long) * nc);
+        long long *p2 = p1 ? (long long *)realloc(spanHi, sizeof(long long) * nc) : NULL;
+        if (p1) spanLo = p1;
+        if (!p1 || !p2) { for (i = 0; i < n; i++) unassign(&U[ids[i]]); return; }
+        spanHi = p2;
+        spanCap = nc;
+    }
+    ns = 0;
+    for (i = 0; i < n; i++) {
+        User *u = &U[ids[i]];
+        for (r = 0; r < u->nrb; r++) {
+            const RB *b = &u->rbs[r];
+            long long lo = b->x, hi = (long long)b->x + b->w - 1;
+            size_t q = ns++;
+            mark_raw(b, 0);
+            ops += (long long)b->w * (4 + W + (useOwn && ownLive ? b->h : 0)) + W + MARK_COST;
+            while (q > 0 && spanLo[q - 1] > lo) {       /* insertion sort by start */
+                spanLo[q] = spanLo[q - 1]; spanHi[q] = spanHi[q - 1]; q--;
+                ops++;
+            }
+            spanLo[q] = lo; spanHi[q] = hi;
+        }
+        u->assigned = 0;
+        curProfit -= u->profit;
+        curArea -= (long long)u->nrb * S;
+    }
+    for (a = 0; a < ns; a = m) {
+        long long lo = spanLo[a], hi = spanHi[a];
+        for (m = a + 1; m < ns && spanLo[m] <= hi + 8; m++) if (spanHi[m] > hi) hi = spanHi[m];
+        for (s = 0; s < nsh; s++)
+            if ((usedSh >> s) & 1U) refresh_shape(s, lo - shW[s] + 1, hi);
+    }
+}
+
 /* ---------- options ---------- */
 
 static const long long *curBits;
@@ -1719,6 +1776,9 @@ static void rebuild_ulist(int v)
     }
     ops += (long long)i * 24 + 16;      /* random access into U: cache misses */
 }
+#ifndef LNS_EXTRA
+#define LNS_EXTRA 24                /* refill candidates: the removed requests and this many more */
+#endif
 #ifndef LDS_STALL
 #define LDS_STALL 10                /* no gain for 1/LDS_STALL of the search budget: stalled */
 #endif
@@ -1729,8 +1789,136 @@ static int skipIds[LDS_MAX + 1];
 static long long ldsHits;
 static int ldsOn;               /* the plain search has stalled: refills try a discrepancy */
 static long long lastImpOps;    /* when the local search last improved */
+static long long lnsStart, lnsStall;    /* start of the local search; no gain this long = stalled */
+static long long lastImpStep, passSteps = -1;   /* steps: at the last gain, in one pass of every class */
 
+/*
+ * CPU-time guard.  The work counter decides everything that is planned, but
+ * how long one unit takes depends on the input (cache misses) and on the
+ * machine, so the local search ends on the processor clock instead: its end
+ * is re-estimated from the measured rate every few milliseconds.  Without a
+ * usable clock the work budget alone is used.
+ */
+#ifndef TIME_LNS
+#define TIME_LNS 10.0               /* CPU seconds: the local search ends here     */
+#endif
+#ifndef TIME_CONS
+#define TIME_CONS 6.5               /* CPU seconds: no extra construction past this */
+#endif
+#ifndef TIME_FIRST
+#define TIME_FIRST 9.0              /* CPU seconds: even the first construction stops */
+#endif
+static int timeOn;                  /* the clock works                              */
+static double lnsT0, nextChk;
+static long long lnsOps0, chkOps, chkGap = 1000000;
+
+static double cpu_now(void)
+{
+    clock_t c = clock();
+    if (c == (clock_t)-1) return -1.0;
+    return (double)c / (double)CLOCKS_PER_SEC;
+}
+
+/* called after every local search step: moves the end of the budget so that
+   the search stops at TIME_LNS */
+static void lns_clock(void)
+{
+    double t, rate;
+    long long e;
+    if (!timeOn || ops - chkOps < chkGap) return;
+    chkOps = ops;
+    t = cpu_now();
+    if (t < 0) return;
+    if (t >= TIME_LNS) { opsEnd = ops; return; }
+    if (t - lnsT0 < 0.2) return;
+    rate = (double)(ops - lnsOps0) / (t - lnsT0);
+    e = ops + (long long)(rate * (TIME_LNS - t));
+    if (e < ops) e = ops;
+    opsEnd = e;
+    hardLimit = opsEnd + (OPS_HARD - OPS_LIMIT) / 4;
+    lnsStall = (opsEnd - lnsStart) / LDS_STALL;
+    chkGap = (long long)(rate * 0.02) + 1;          /* next look in about 20 ms */
+    (void)nextChk;
+}
+
+/*
+ * Randomized phase, entered once the sweep has stalled.  The generator has a
+ * fixed seed, so the output is still the same on every run.
+ *   - regions of random size and position,
+ *   - refill order: log(profit) - alpha * log(smallest area) + noise,
+ *   - a slightly worse refill may be kept (annealing on the profit); the best
+ *     solution seen is kept aside and is the answer.
+ */
+#ifndef SEED
+#define SEED 0x9E3779B97F4A7C15ULL
+#endif
+static u64 rngS = SEED;
+static int saOn;                    /* randomized phase active               */
+static double saTemp = 1.0;         /* annealing temperature (profit units)  */
+static double saNoise, saAlpha = 1.0;
+static float *lpU, *laU;            /* log profit, log smallest area         */
+static long long bestP = -1, bestA; /* best solution of the randomized phase */
+static int bestIsCur = 1;           /* the current solution is the best one  */
+typedef struct { double k; int id; } SaKey;
+static SaKey *saBuf;
+
+static u64 rng_next(void)
+{
+    rngS ^= rngS >> 12; rngS ^= rngS << 25; rngS ^= rngS >> 27;
+    return rngS * 0x2545F4914F6CDD1DULL;
+}
+
+static double rng_unif(void)        /* [0, 1) */
+{
+    return (double)(rng_next() >> 11) * (1.0 / 9007199254740992.0);
+}
+
+static int cmp_sakey(const void *p, const void *q)
+{
+    const SaKey *a = (const SaKey *)p, *b = (const SaKey *)q;
+    if (a->k != b->k) return a->k > b->k ? -1 : 1;
+    return (a->id > b->id) - (a->id < b->id);
+}
+
+#ifndef SA_ALLOW
+#define SA_ALLOW 1
+#endif
+static int sa_keep_worse(long long oldP, long long oldA, int nr, int na);
+static int saAllowed = SA_ALLOW;
+
+/* no gain for a long share of the budget, or for two full passes of the
+   sweep over every region */
+static int is_stalled(void)
+{
+    return ops - lastImpOps > lnsStall || (passSteps > 0 && lnsSteps - lastImpStep > 2 * passSteps);
+}
+
+/* the sweep has gone a while without gain: first try one discrepancy per
+   refill, then (if that stalls too) the randomized phase */
+static void stalled(void)
+{
+    if (!ldsOn) { ldsOn = 1; lastImpOps = ops; lastImpStep = lnsSteps; }
+    else if (saAllowed) saOn = 1;
+}
+
+#ifdef DIAG
+long long dgSteps, dgNr, dgNc, dgNa, dgImp, dgEq, dgWorse;
+int dgCls = 0;                      /* region class of the current step */
+long long dgClsOps[64], dgClsSteps[64], dgClsGain[64], dgClsNr[64];
+#endif
+static int lns_step_(int t0, int t1, int v);
 static int lns_step(int t0, int t1, int v)
+{
+#ifdef DIAG
+    long long o0 = ops, p0 = curProfit;
+    int r = lns_step_(t0, t1, v);
+    dgClsOps[dgCls] += ops - o0; dgClsSteps[dgCls]++; dgClsGain[dgCls] += curProfit - p0;
+    return r;
+#else
+    return lns_step_(t0, t1, v);
+#endif
+}
+static int lns_step_(int t0, int t1, int v)
 {
     long long oldP = curProfit, oldA = curArea;
     int nr = 0, nc = 0, na = 0, i, j, lim, hi;
@@ -1765,18 +1953,8 @@ static int lns_step(int t0, int t1, int v)
         if (pu + (size_t)u->nrb > poolCap) {
             size_t nc2 = (pu + (size_t)u->nrb) * 2;
             RB *np = (RB *)realloc(pool, sizeof(RB) * nc2);
-            if (!np) {              /* cannot back up: put the removed users back */
+            if (!np) {              /* cannot back up: leave the region as it is */
                 for (j = 0; j < nr; j++) inRem[remList[j]] = 0;
-                nr = i;
-                for (j = 0; j < nr; j++) {
-                    User *w2 = &U[remList[j]];
-                    int r;
-                    memcpy(w2->rbs, pool + remStart[j], sizeof(RB) * (size_t)remCnt[j]);
-                    w2->nrb = remCnt[j]; w2->assigned = 1;
-                    curProfit += w2->profit; curArea += (long long)w2->nrb * S;
-                    curOwner = remList[j];
-                    for (r = 0; r < w2->nrb; r++) mark_rb(&w2->rbs[r], 1);
-                }
                 return 0;
             }
             pool = np;
@@ -1784,11 +1962,10 @@ static int lns_step(int t0, int t1, int v)
         }
         memcpy(pool + pu, u->rbs, sizeof(RB) * (size_t)u->nrb);
         remStart[i] = (int)pu; remCnt[i] = u->nrb; pu += (size_t)u->nrb;
-        unassign(u);
-        inRem[remList[i]] = 1;
         candList[nc++] = remList[i];
     }
-    lim = nr + 24;
+    unassign_batch(remList, nr);
+    lim = nr + LNS_EXTRA;
     if (!unsortedArr) {
         /* users that can intersect [t0, t1] have arrival in [t0 - maxWin, t1] */
         int lo = 0, h2 = N;
@@ -1849,34 +2026,58 @@ static int lns_step(int t0, int t1, int v)
     lnsSteps++;
     for (i = 0; i < nr; i++) inRem[remList[i]] = 0;
     curVar = v;
-    qsort(candList, (size_t)nc, sizeof(int), cmp_rank);
+    if (saOn && saBuf) {
+        for (i = 0; i < nc; i++) {
+            int id = candList[i];
+            saBuf[i].k = (double)lpU[id] - saAlpha * (double)laU[id] + saNoise * (2.0 * rng_unif() - 1.0);
+            saBuf[i].id = id;
+        }
+        qsort(saBuf, (size_t)nc, sizeof(SaKey), cmp_sakey);
+        for (i = 0; i < nc; i++) candList[i] = saBuf[i].id;
+        ops += 20LL * nc;
+    } else qsort(candList, (size_t)nc, sizeof(int), cmp_rank);
     for (i = 0; i < nc && ops <= hardLimit; i++)
         if (place_user(&U[candList[i]])) addList[na++] = candList[i];
 
+#ifdef DIAG
+    {
+        extern long long dgSteps, dgNr, dgNc, dgNa, dgImp, dgEq;
+        dgSteps++; dgNr += nr; dgNc += nc; dgNa += na;
+        if (curProfit > oldP || (curProfit == oldP && curArea < oldA)) dgImp++;
+        else if (curProfit == oldP && curArea == oldA) dgEq++;
+    }
+#endif
     /* keep: more profit, or equal profit with no more area */
     if (curProfit > oldP || (curProfit == oldP && curArea <= oldA)) {
-        if (curProfit > oldP || curArea < oldA) lastImpOps = ops;
+        if (curProfit > oldP || curArea < oldA) { lastImpOps = ops; lastImpStep = lnsSteps; }
+        if (saOn && (curProfit > bestP || (curProfit == bestP && curArea < bestA))) {
+            bestP = curProfit; bestA = curArea; bestIsCur = 1;
+        }
         return curProfit > oldP || curArea < oldA;
     }
+    if (saOn && sa_keep_worse(oldP, oldA, nr, na)) return 0;
 #ifdef LDS_MAX
     /* one discrepancy: leave out one of the requests the refill placed, so
        that others may fit instead; the first strict improvement is kept */
-    if (ldsOn && nc <= LDS_MAX) {
+#ifndef SA_LDS
+#define SA_LDS 0
+#endif
+    if (ldsOn && (SA_LDS || !saOn) && nc <= LDS_MAX) {
         int na0 = na, q;
         for (q = 0; q < na0; q++) skipIds[q] = addList[q];
         for (q = 0; q < na0 && ops <= hardLimit; q++) {
-            for (i = 0; i < na; i++) unassign(&U[addList[i]]);
+            unassign_batch(addList, na);
             na = 0;
             for (i = 0; i < nc && ops <= hardLimit; i++) {
                 if (candList[i] == skipIds[q]) continue;
                 if (place_user(&U[candList[i]])) addList[na++] = candList[i];
             }
-            if (curProfit > oldP || (curProfit == oldP && curArea < oldA)) { ldsHits++; lastImpOps = ops; return 1; }
+            if (curProfit > oldP || (curProfit == oldP && curArea < oldA)) { ldsHits++; lastImpOps = ops; lastImpStep = lnsSteps; return 1; }
         }
     }
 #endif
 
-    for (i = 0; i < na; i++) unassign(&U[addList[i]]);
+    unassign_batch(addList, na);
     for (i = 0; i < nr; i++) {
         User *u = &U[remList[i]];
         memcpy(u->rbs, pool + remStart[i], sizeof(RB) * (size_t)remCnt[i]);
@@ -1995,7 +2196,7 @@ static char *snapA;
 static int *snapCnt;
 static size_t *snapStart;
 static RB *snapPool;
-static size_t snapCap;
+static size_t snapCap, snapUsed;
 static long long snapP = -1, snapArea;
 static int snapOut;          /* 1: the answer is the snapshot (grid not restored) */
 
@@ -2028,7 +2229,49 @@ static void save_snapshot(void)
         snapStart[i] = used; snapCnt[i] = u->nrb; used += (size_t)u->nrb;
     }
     snapP = curProfit; snapArea = curArea;
+    snapUsed = used;
     ops += N + (long long)used * 2;
+}
+
+/*
+ * Randomized phase: keep the refill just made although it lost profit (or
+ * kept the profit with more area), with probability exp(-loss / temperature).
+ * If the state before it was the best one, that state is saved first: the
+ * current solution, with the refill's requests taken out and the removed
+ * requests put back.
+ */
+static int sa_keep_worse(long long oldP, long long oldA, int nr, int na)
+{
+    double loss = (double)(oldP - curProfit);
+    int i;
+    if (loss <= 0) loss = 0.05 * saTemp;            /* same profit, more area */
+    if (loss > 30.0 * saTemp || rng_unif() >= my_exp(-loss / saTemp)) return 0;
+    if (bestIsCur) {
+        size_t used;
+        save_snapshot();
+        if (snapP < 0) return 0;
+        used = snapUsed;
+        for (i = 0; i < na; i++) snapA[addList[i]] = 0;
+        for (i = 0; i < nr; i++) {
+            int id = remList[i];
+            if (used + (size_t)remCnt[i] > snapCap) {
+                size_t nc = (used + (size_t)remCnt[i]) * 2 + 64;
+                RB *np = (RB *)realloc(snapPool, sizeof(RB) * nc);
+                if (!np) { snapP = -1; return 0; }
+                snapPool = np; snapCap = nc;
+            }
+            memcpy(snapPool + used, pool + remStart[i], sizeof(RB) * (size_t)remCnt[i]);
+            snapA[id] = 1; snapStart[id] = used; snapCnt[id] = remCnt[i];
+            used += (size_t)remCnt[i];
+        }
+        snapP = oldP; snapArea = oldA;
+        ops += 4LL * (nr + na);
+        bestIsCur = 0;
+    }
+#ifdef DIAG
+    dgWorse++;
+#endif
+    return 1;
 }
 
 static void restore_snapshot(void)
@@ -2095,6 +2338,7 @@ static int place_big(User *u)
 }
 
 static int longWhole;           /* the last first construction kept the long lookahead to the end */
+static double consLimit = 1e30; /* CPU seconds: the running construction stops here */
 static double loadRatio;        /* total smallest area of the requests / grid area */
 
 static int greedy(int v, long long budget, int mode)
@@ -2120,6 +2364,7 @@ static int greedy(int v, long long budget, int mode)
         lookMul = LONG_LOOK; longOn = 1; longOps = ops; longI = 0;
     }
     for (i = 0; i < nAss && ops - start <= budget; i++) {
+        if ((i & 255) == 0 && timeOn && cpu_now() > consLimit) break;   /* out of time */
         if (longOn && i < longEnd && (i & 63) == 0 && i - longI >= 256 && lookMul > LONG_MIN) {
             /* halve the lookahead while the rest of the core would not fit in the cap */
             double rate = (double)(ops - longOps) / (double)(i - longI);
@@ -2212,7 +2457,10 @@ static int greedy(int v, long long budget, int mode)
     if (nBig > 0 && ops - start <= budget) {
         if (shDirty) refresh_dirty();
         leanMode = 0;
-        for (; bj < nBig && ops - start <= budget; bj++) placedNow += place_big(&U[bigIdx[bj]]);
+        for (; bj < nBig && ops - start <= budget; bj++) {
+            if ((bj & 63) == 0 && timeOn && cpu_now() > consLimit) break;
+            placedNow += place_big(&U[bigIdx[bj]]);
+        }
     }
     /* the planned pass pays off only if a real share went without lookahead */
     greedySwitched = firstFitUsers * 20 >= nAss;
@@ -2504,12 +2752,203 @@ static void build_shapes(void)
     }
 }
 
+#ifdef DIAG
+static void lns_trace(long long lnsStart, int cycle)
+{
+    static int nextTr = 1;
+    if ((ops - lnsStart) * 20 >= (opsEnd - lnsStart) * nextTr) {
+        fprintf(stderr, "  lns %2d/20 profit=%lld area=%lld best=%lld steps=%lld lds=%d sa=%d T=%.3g cycle=%d | avg nr=%.1f nc=%.1f na=%.1f imp=%lld eq=%lld worse=%lld\n",
+                nextTr, curProfit, curArea, saOn ? bestP : curProfit, lnsSteps, ldsOn, saOn, saTemp, cycle,
+                (double)dgNr / (dgSteps + 1e-9), (double)dgNc / (dgSteps + 1e-9), (double)dgNa / (dgSteps + 1e-9), dgImp, dgEq, dgWorse);
+        nextTr++;
+    }
+}
+#endif
+
+#ifndef SA_T0
+#define SA_T0 0.1       /* starting temperature, in average profits of an accepted request */
+#endif
+#ifndef SA_T1
+#define SA_T1 0.003     /* final temperature, same unit */
+#endif
+#ifndef SA_NOISE
+#define SA_NOISE 0.5    /* most noise added to log(profit / area^alpha) */
+#endif
+
+/*
+ * Randomized phase until the end of the budget (see above).  Returns 0 if it
+ * could not start (no memory).
+ */
+static int sa_run(const int *widths, int nw)
+{
+    long long saStart = ops, nAss = 0;
+    double t0v, lr;
+    int i, nv = nVar < NVAR_LNS ? nVar : NVAR_LNS;
+    lpU = (float *)malloc(sizeof(float) * ((size_t)N + 1));
+    laU = (float *)malloc(sizeof(float) * ((size_t)N + 1));
+    saBuf = (SaKey *)malloc(sizeof(SaKey) * ((size_t)N + 64));
+    if (!lpU || !laU || !saBuf) {
+        free(lpU); free(laU); free(saBuf); lpU = laU = 0; saBuf = 0;
+        return 0;
+    }
+    for (i = 0; i < N; i++) {
+        const User *u = &U[i];
+        if (u->nopt > 0 && u->profit > 0 && u->minArea > 0) {
+            lpU[i] = (float)my_log((double)u->profit);
+            laU[i] = (float)my_log((double)u->minArea);
+        } else lpU[i] = laU[i] = 0;
+        nAss += u->assigned;
+    }
+    ops += 80LL * N;
+    t0v = SA_T0 * (double)(curProfit > 0 ? curProfit : 1) / (double)(nAss > 0 ? nAss : 1);
+    lr = my_log(SA_T1 / SA_T0);
+    bestP = curProfit; bestA = curArea; bestIsCur = 1;
+    while (ops < opsEnd) {
+        double prog = (double)(ops - saStart) / (double)(opsEnd - saStart);
+        int j = (int)(rng_next() % 3), hb, v;
+        long long wd, t0, s0, s1, r0;
+        saTemp = t0v * my_exp(lr * prog);
+        hb = (int)(((long long)Y + (1LL << j) - 1) >> j);
+        wd = (long long)widths[rng_next() % (u64)nw] * (j ? 2 : 1);
+        if (wd > X) wd = X;
+        t0 = (long long)(rng_next() % (u64)(X + wd - 1)) - (wd - 1);
+        s0 = t0 < 0 ? 0 : t0;
+        s1 = t0 + wd - 1 > X - 1 ? X - 1 : t0 + wd - 1;
+        r0 = (long long)(rng_next() % (u64)(Y - hb + 1));
+        ry0 = (int)r0; ry1 = (int)(r0 + hb - 1);
+        saAlpha = 0.6 + rng_unif();
+        saNoise = SA_NOISE * rng_unif();
+        v = (int)(rng_next() % (u64)nv);
+        lns_step((int)s0, (int)s1, v);
+        lns_clock();
+#ifdef DIAG
+        lns_trace(lnsStart, -1);
+#endif
+    }
+    if (!bestIsCur && snapP >= 0) snapOut = 1;      /* answer: the best solution seen */
+    return 1;
+}
+
+/*
+ * Adaptive sweep.  A class is a region shape (row band height, strip width);
+ * each class sweeps the grid with its own cursor (time strips, then row
+ * bands, shifted on every new pass).  The work is cut into short segments and
+ * each segment goes to a class chosen in proportion to the profit it gained
+ * per unit of work recently (every class keeps a small share).
+ */
+#ifndef ADAPT
+#define ADAPT 1
+#endif
+#ifndef SEG_DIV
+#define SEG_DIV 200                 /* a segment is about 1/SEG_DIV of the search budget */
+#endif
+#define NCLS 32
+#ifndef CLS_FLOOR
+#define CLS_FLOOR 0.05
+#endif
+typedef struct {
+    int mode, hb, rstep, pass, seen;
+    long long wd, step, t0, r0;
+    double rate;                    /* recent profit gained per unit of work */
+} Cls;
+static Cls cls[NCLS];
+static int ncls;
+
+static void cls_init(const int *widths, int nw)
+{
+    int mode, wi;
+    ncls = 0;
+    for (mode = 0; mode < 3; mode++) {
+        int hb = (int)(((long long)Y + (1LL << mode) - 1) >> mode);   /* Y, Y/2, Y/4 */
+        if (mode > 0 && hb >= Y) continue;
+        for (wi = 0; wi < nw && ncls < NCLS; wi++) {
+            Cls *c = &cls[ncls++];
+            long long wd = (long long)widths[wi] * (mode ? 2 : 1);
+            if (wd > X) wd = X;
+            c->mode = mode; c->hb = hb; c->rstep = hb / 2 > 0 ? hb / 2 : 1;
+            c->wd = wd; c->step = wd / 2 > 0 ? wd / 2 : 1;
+            c->pass = 0; c->seen = 0; c->rate = 0;
+            c->t0 = -c->step; c->r0 = 0;
+        }
+    }
+    passSteps = 0;
+    for (wi = 0; wi < ncls; wi++) {
+        const Cls *c = &cls[wi];
+        long long bands = c->mode ? (Y - c->hb + c->rstep - 1) / c->rstep + 1 : 1;
+        passSteps += ((long long)X + c->step - 1) / c->step * bands;
+    }
+}
+
+/* one refill at the cursor of class c, then move the cursor */
+static void cls_step(Cls *c, int v)
+{
+    long long s0 = c->t0 < 0 ? 0 : c->t0, s1 = c->t0 + c->wd - 1;
+    if (s1 > X - 1) s1 = X - 1;
+    if (s1 >= s0) {
+        ry0 = c->mode ? (int)c->r0 : 0;
+        ry1 = c->mode ? (int)(c->r0 + c->hb - 1 < Y - 1 ? c->r0 + c->hb - 1 : Y - 1) : Y - 1;
+        lns_step((int)s0, (int)s1, v);
+    }
+    if (c->mode && c->r0 + c->hb < Y) { c->r0 += c->rstep; return; }
+    c->r0 = 0;
+    c->t0 += c->step;
+    if (c->t0 >= X) {                   /* new pass, shifted by a third of a step */
+        c->pass++;
+        c->t0 = ((long long)c->pass * c->step / 3) % c->step - c->step;
+    }
+}
+
+static int cls_pick(void)
+{
+    double tot = 0, mx = 0, r;
+    int i;
+    for (i = 0; i < ncls; i++) if (!cls[i].seen) return i;     /* every class once, in order */
+    for (i = 0; i < ncls; i++) if (cls[i].rate > mx) mx = cls[i].rate;
+    for (i = 0; i < ncls; i++) tot += cls[i].rate + CLS_FLOOR * mx + 1e-12;
+    r = rng_unif() * tot;
+    for (i = 0; i < ncls - 1; i++) {
+        r -= cls[i].rate + CLS_FLOOR * mx + 1e-12;
+        if (r < 0) break;
+    }
+    return i;
+}
+
+/* the sweep, until the budget ends or the randomized phase starts */
+static void lns_sweep(int *vc)
+{
+    int nv = nVar < NVAR_LNS ? nVar : NVAR_LNS;
+    while (ops < opsEnd && !saOn) {
+        int ci = cls_pick();
+        Cls *c = &cls[ci];
+        long long o0 = ops, p0 = curProfit, seg = (opsEnd - lnsStart) / SEG_DIV;
+        double r;
+        if (seg < 2000000) seg = 2000000;
+        do {
+#ifdef DIAG
+            { extern int dgCls; dgCls = c->mode * 8 + (int)(ci % 8); }
+#endif
+            cls_step(c, (*vc)++ % nv);
+            lns_clock();
+#ifdef DIAG
+            lns_trace(lnsStart, c->pass);
+#endif
+            if (is_stalled()) stalled();
+        } while (ops - o0 < seg && ops < opsEnd && !saOn);
+        r = (double)(curProfit - p0) / (double)(ops - o0 + 1);
+        c->rate = c->seen ? 0.6 * c->rate + 0.4 * r : r;
+        c->seen = 1;
+    }
+}
+
 int main(void)
 {
     long long t, hdr[4];
     int i, y, v, maxK = 1;
     long long *bits;
 
+#ifndef NO_CLOCK
+    timeOn = cpu_now() >= 0;
+#endif
     for (i = 0; i < 4; i++) if (!read_ll(&hdr[i])) { print_empty(); return 0; }
     if (hdr[0] <= 0 || hdr[1] <= 0 || hdr[2] <= 0 || hdr[3] <= 0 ||
         hdr[0] > 2000000000LL || hdr[2] > 2000000000LL) {
@@ -2710,7 +3149,7 @@ int main(void)
            The best construction is kept. */
         static const int cfgL[] = {LOOK_MUL, LOOK_MUL, 32, 96};
         static const int cfgMode[] = {GR_TRY, GR_PLANNED, GR_PLAIN, GR_PLAIN};
-        int nCfg = (int)(sizeof(cfgL) / sizeof(cfgL[0])), ci, bestC = -1, lastC = -1, r, switched = 0, wideLook = 32;
+        int nCfg = (int)(sizeof(cfgL) / sizeof(cfgL[0])), ci, bestC = -1, lastC = -1, r, switched = 0, wideLook = 32, lnsWill;
         long long gP = -1, gA = 0, gEnd, prevCost = 0;
         if (rest < OPS_LIMIT / 3) rest = OPS_LIMIT / 3;   /* the greedy always gets a share */
         gBudget = rest * 97 / 100;
@@ -2729,8 +3168,13 @@ int main(void)
         hardLimit = base + rest + (OPS_HARD - OPS_LIMIT);
         ownLive = 0;                            /* only the local search needs owners */
         ownValid = 0;
+        double tPrev = 0;               /* CPU seconds of the last construction */
         for (ci = 0; ci < nCfg; ci++) {
             long long st = ops;
+            double tNow = timeOn ? cpu_now() : 0;
+            /* time: the next construction (up to 3.5 times the last one) must end by TIME_CONS */
+            if (ci > 0 && timeOn && tNow + tPrev * (ci == 3 ? 2.0 : 3.5) > TIME_CONS) break;
+            consLimit = ci == 0 ? TIME_FIRST : TIME_CONS;
             if (ci == 1 && (!switched || !cpValid || ops + cpTot * 12 / 10 > gEnd)) continue;
             if (ci == 2 && longWhole) continue;   /* the first one already had the long lookahead */
             if (ci == 2) {
@@ -2752,6 +3196,7 @@ int main(void)
             fprintf(stderr, "  config %d look=%d mode=%d complete=%d switched=%d profit=%lld cost=%.3g ops=%.3g\n", ci, cfgL[ci], cfgMode[ci], r, greedySwitched, curProfit, (double)(ops - st), (double)ops);
 #endif
             prevCost = ops - st;
+            if (timeOn) tPrev = cpu_now() - tNow;
             lastC = ci;
             if (curProfit > gP || (curProfit == gP && curArea < gA)) {
                 gP = curProfit; gA = curArea; bestC = ci;
@@ -2759,15 +3204,20 @@ int main(void)
             }
             if (!r) break;                      /* out of budget */
         }
+        /* a local search follows if work budget (or, with the clock, time) is left */
+        lnsWill = timeOn ? cpu_now() < TIME_LNS - 0.2 : ops < normEnd;
+        consLimit = 1e30;
         if (bestC >= 0 && bestC != lastC) {
-            if (snapP >= 0 && ops >= normEnd) snapOut = 1;     /* no local search follows */
+            if (snapP >= 0 && !lnsWill) snapOut = 1;           /* no local search follows */
             else if (snapP >= 0) restore_snapshot();
             else { lookMul = bestC == 2 ? wideLook : cfgL[bestC]; greedy(0, gBudget, GR_PLAIN); }
         }
         ownLive = 1;
-        if (useOwn && !snapOut && ops < normEnd) { rebuild_owner(); ownValid = 1; }
-        lookMul = LOOK_MUL;
+        if (useOwn && !snapOut && lnsWill) { rebuild_owner(); ownValid = 1; }
+        lookMul = LNS_LOOK;
         opsEnd = normEnd;
+        if (!lnsWill) opsEnd = ops < normEnd ? ops : normEnd;
+        else if (timeOn && opsEnd < ops + NORM_LIMIT / 20) opsEnd = ops + NORM_LIMIT / 20;   /* the clock corrects it */
         hardLimit = normEnd + (OPS_HARD - OPS_LIMIT) / 4;
         if (hardLimit < ops) hardLimit = ops;
         (void)cost0;
@@ -2813,41 +3263,64 @@ int main(void)
                 qsort(widths, (size_t)nw, sizeof(int), cmp_int);
             }
             {
-                long long lnsStart = ops, stall;
-                lastImpOps = ops;
-                stall = (opsEnd - lnsStart) / LDS_STALL;
-            while (ops < opsEnd) {
+                lnsStart = ops;
+                lastImpOps = ops; lastImpStep = lnsSteps;
+                lnsStall = (opsEnd - lnsStart) / LDS_STALL;
+                if (timeOn) { lnsT0 = cpu_now(); lnsOps0 = ops; chkOps = ops; }
+            if (ADAPT) cls_init(widths, nw);
+            for (;;) {
+            if (ADAPT) lns_sweep(&vc);
+            while (!ADAPT && ops < opsEnd && !saOn) {
                 int wi, mode = cycle % 3;
-                if (!ldsOn && ops - lastImpOps > stall) ldsOn = 1;
                 int hb = (int)(((long long)Y + (1LL << mode) - 1) >> mode);   /* Y, Y/2, Y/4, ... */
                 int rstep = hb / 2 > 0 ? hb / 2 : 1;
                 long long r0;
+                if (is_stalled()) stalled();
                 if (mode > 0 && hb >= Y) { cycle++; continue; }
-                for (wi = 0; wi < nw && ops < opsEnd; wi++) {
+                for (wi = 0; wi < nw && ops < opsEnd && !saOn; wi++) {
                     long long wd = (long long)widths[wi] * (mode ? 2 : 1), step, off, t0;
                     if (wd > X) wd = X;
                     step = wd / 2 > 0 ? wd / 2 : 1;
                     off = ((long long)(cycle / 3) * step / 3) % step;
-                    for (t0 = off - step; t0 < X && ops < opsEnd; t0 += step) {
+                    for (t0 = off - step; t0 < X && ops < opsEnd && !saOn; t0 += step) {
                         long long s0 = t0 < 0 ? 0 : t0, s1 = t0 + wd - 1;
                         if (s1 > X - 1) s1 = X - 1;
                         if (s1 < s0) continue;
-                        for (r0 = 0; r0 < Y && ops < opsEnd; r0 += (mode ? rstep : Y)) {
+                        for (r0 = 0; r0 < Y && ops < opsEnd && !saOn; r0 += (mode ? rstep : Y)) {
                             ry0 = mode ? (int)r0 : 0;
                             ry1 = mode ? (int)(r0 + hb - 1 < Y - 1 ? r0 + hb - 1 : Y - 1) : Y - 1;
+#ifdef DIAG
+                            { extern int dgCls; dgCls = mode * 8 + wi; }
+#endif
                             lns_step((int)s0, (int)s1, vc % (nVar < NVAR_LNS ? nVar : NVAR_LNS));
+                            lns_clock();
                             vc++;
-                            if (!ldsOn && ops - lastImpOps > stall) ldsOn = 1;
+#ifdef DIAG
+                            lns_trace(lnsStart, cycle);
+#endif
+                            if (is_stalled()) stalled();
                             if (mode && r0 + hb >= Y) break;
                         }
                     }
                 }
                 cycle++;
             }
+            if (!saOn || ops >= opsEnd) break;
+            if (sa_run(widths, nw)) break;
+            saOn = 0; saAllowed = 0; ldsOn = 1;   /* could not start: back to the sweep */
+            }
             }
         }
     }
 
+#ifdef DIAG
+    {
+        int c;
+        extern long long dgClsOps[64], dgClsSteps[64], dgClsGain[64];
+        for (c = 0; c < 64; c++) if (dgClsSteps[c])
+            fprintf(stderr, "  class mode=%d wi=%d steps=%lld ops=%.3g gain=%lld gain/Gops=%.1f\n", c / 8, c % 8, dgClsSteps[c], (double)dgClsOps[c], dgClsGain[c], dgClsGain[c] / (dgClsOps[c] / 1e9));
+    }
+#endif
     /* 3. output (sorted by user id; hand-formatted, buffered) */
     {
         int na = 0, sorted = 1;
