@@ -28,22 +28,19 @@
  *      x row band) are removed and the region is refilled by priority
  *      (removed + unassigned users).  A move is kept if profit increases, or
  *      stays equal with less used area.  Region shapes are swept with one
- *      cursor each, and each short segment of work goes to a shape chosen in
- *      proportion to its recent gain.  Once the sweep stalls, each refill also
- *      tries leaving out one of the requests it placed (one discrepancy);
- *      when that stalls too, a randomized phase follows (random regions,
- *      noisy refill order, annealing on the profit; best solution kept).
- *      The generator has a fixed seed.
- *   Time: planning uses an operation counter; the local search ends on the
- *   processor clock (TIME_LNS seconds, limit 15 s), so heavy inputs cannot run
- *   long and light ones use the time.  Results can therefore differ slightly
- *   between runs.  Compile with -DNO_CLOCK for a fixed, repeatable budget.
+ *      cursor each, and short segments of work are shared out among the
+ *      shapes in proportion to their recent gain.  Once the sweep stalls, each
+ *      refill also tries leaving out one of the requests it placed (one
+ *      discrepancy); when that stalls too, a threshold phase follows: refill
+ *      orders are enumerated in a fixed cycle and a refill losing at most a
+ *      threshold (falling to zero) is kept; the best solution is the answer.
+ *   Fully deterministic: no randomness, no clock.  All work is bounded by an
+ *   operation counter whose costs follow the measured run time.
  *   No input range is assumed: every array is sized from the input.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 typedef unsigned long long u64;
 
@@ -56,11 +53,22 @@ typedef unsigned long long u64;
 #define WIDE_LIMITV 15000000000LL   /* the wider-lookahead construction may run up to here */
 #endif
 #ifndef NORM_LIMITV
-#define NORM_LIMITV 13000000000LL
+#define NORM_LIMITV 16000000000LL
 #endif
-#define NORM_LIMIT NORM_LIMITV
-#define OPS_LIMIT OPS_LIMITV      /* soft work budget                   */
-#define OPS_HARD  (OPS_LIMIT + 1100000000LL)      /* hard work budget                   */
+/*
+ * The budgets are calibrated for an optimized build (-O1 and up: at most
+ * about 9 s on the test machine).  Built without optimization, every unit of
+ * work takes about 2.5 times longer, so the budgets are divided accordingly
+ * (__OPTIMIZE__ is a compile-time constant of GCC and Clang).
+ */
+#if defined(__GNUC__) && !defined(__OPTIMIZE__)
+#define BUDGET(v) ((v) / 5 * 2)
+#else
+#define BUDGET(v) (v)
+#endif
+#define NORM_LIMIT BUDGET(NORM_LIMITV)
+#define OPS_LIMIT BUDGET(OPS_LIMITV)      /* soft work budget                   */
+#define OPS_HARD  (OPS_LIMIT + BUDGET(1100000000LL))      /* hard work budget                   */
 #define MEM_GRID  900000000.0
 #define MAX_COLS  30000000LL        /* most columns the grid keeps */      /* bytes allowed for the grid levels  */
 #ifndef MAX_RB
@@ -1727,7 +1735,7 @@ static int cmp_order(const void *p, const void *q)
 /*
  * Same order as cmp_order (key descending, then deadline ascending, then index
  * ascending), computed with stable LSD radix sorts instead of qsort: sequential
- * passes are far cheaper than a comparator chasing random memory.
+ * passes are far cheaper than a comparator chasing scattered memory.
  */
 typedef struct { u64 k; int id; } KeyId;
 static KeyId *rsA, *rsB;
@@ -1808,7 +1816,7 @@ static void rebuild_ulist(int v)
         if (U[id].nopt <= 0) break;
         if (!U[id].assigned) ulist[v][ulen[v]++] = id;
     }
-    ops += (long long)i * 24 + 16;      /* random access into U: cache misses */
+    ops += (long long)i * 24 + 16;      /* scattered reads of U: cache misses */
 }
 #ifndef REG_USERS
 #define REG_USERS 256               /* largest region: about this many average requests */
@@ -1817,7 +1825,7 @@ static void rebuild_ulist(int v)
 #define LNS_EXTRA 24                /* refill candidates: the removed requests and this many more */
 #endif
 #ifndef SA_EXTRA
-#define SA_EXTRA 24                 /* the same in the randomized phase */
+#define SA_EXTRA 24                 /* the same in the threshold phase */
 #endif
 #ifndef LDS_STALL
 #define LDS_STALL 10                /* no gain for 1/LDS_STALL of the search budget: stalled */
@@ -1832,89 +1840,34 @@ static long long lastImpOps;    /* when the local search last improved */
 static long long lnsStart, lnsStall;    /* start of the local search; no gain this long = stalled */
 static long long lastImpStep, passSteps = -1;   /* steps: at the last gain, in one pass of every class */
 
-/*
- * CPU-time guard.  The work counter decides everything that is planned, but
- * how long one unit takes depends on the input (cache misses) and on the
- * machine, so the local search ends on the processor clock instead: its end
- * is re-estimated from the measured rate every few milliseconds.  Without a
- * usable clock the work budget alone is used.
- */
-#ifndef TIME_LNS
-#define TIME_LNS 10.0               /* CPU seconds: the local search ends here     */
-#endif
-#ifndef TIME_CONS
-#define TIME_CONS 8.0               /* CPU seconds: no extra construction past this */
-#endif
-#ifndef TIME_FIRST
-#define TIME_FIRST 9.0              /* CPU seconds: even the first construction stops */
-#endif
-static int timeOn;                  /* the clock works                              */
-static double lnsT0, nextChk;
-static long long lnsOps0, chkOps, chkGap = 1000000;
-
-static double cpu_now(void)
-{
-    clock_t c = clock();
-    if (c == (clock_t)-1) return -1.0;
-    return (double)c / (double)CLOCKS_PER_SEC;
-}
-
-/* called after every local search step: moves the end of the budget so that
-   the search stops at TIME_LNS */
 static long long allProfit = -1;    /* profit of every request that has an option */
 
-static void lns_clock(void)
+/* after every local search step: nothing is left to gain once everybody is served */
+static void lns_check(void)
 {
-    double t, rate;
-    long long e;
-    if (curProfit >= allProfit && allProfit >= 0) { opsEnd = ops; return; }   /* everybody is served */
-    if (!timeOn || ops - chkOps < chkGap) return;
-    chkOps = ops;
-    t = cpu_now();
-    if (t < 0) return;
-    if (t >= TIME_LNS) { opsEnd = ops; return; }
-    if (t - lnsT0 < 0.2) return;
-    rate = (double)(ops - lnsOps0) / (t - lnsT0);
-    e = ops + (long long)(rate * (TIME_LNS - t));
-    if (e < ops) e = ops;
-    opsEnd = e;
-    hardLimit = opsEnd + (OPS_HARD - OPS_LIMIT) / 4;
-    lnsStall = (opsEnd - lnsStart) / LDS_STALL;
-    chkGap = (long long)(rate * 0.02) + 1;          /* next look in about 20 ms */
-    (void)nextChk;
+    if (curProfit >= allProfit && allProfit >= 0) opsEnd = ops;
 }
 
 /*
- * Randomized phase, entered once the sweep has stalled.  The generator has a
- * fixed seed, so the output is still the same on every run.
- *   - regions of random size and position,
- *   - refill order: log(profit) - alpha * log(smallest area) + noise,
- *   - a slightly worse refill may be kept (annealing on the profit); the best
- *     solution seen is kept aside and is the answer.
+ * Threshold phase, entered once the sweep (with one discrepancy) has stalled.
+ * Everything is deterministic:
+ *   - the sweep goes on over the same regions,
+ *   - refill orders are enumerated in a fixed cycle: log(profit) -
+ *     alpha * log(smallest area) for a table of alpha values, with the j-th
+ *     candidate moved to the front (j = 0, 1, 2, ... in turn),
+ *   - a refill that loses at most the current threshold is kept (threshold
+ *     accepting); the threshold falls to zero by the end of the budget.  The
+ *     best solution seen is kept aside and is the answer.
  */
-#ifndef SEED
-#define SEED 0x9E3779B97F4A7C15ULL
-#endif
-static u64 rngS = SEED;
-static int saOn;                    /* randomized phase active               */
-static double saTemp = 1.0;         /* annealing temperature (profit units)  */
-static double saNoise, saAlpha = 1.0;
+static int saOn;                    /* threshold phase active                */
+static double saThr;                /* largest profit loss kept now          */
+static double saAlpha = 1.0;        /* refill order of this step             */
+static long long saPromote;         /* candidate moved to the front          */
 static float *lpU, *laU;            /* log profit, log smallest area         */
-static long long bestP = -1, bestA; /* best solution of the randomized phase */
+static long long bestP = -1, bestA; /* best solution of the threshold phase  */
 static int bestIsCur = 1;           /* the current solution is the best one  */
 typedef struct { double k; int id; } SaKey;
 static SaKey *saBuf;
-
-static u64 rng_next(void)
-{
-    rngS ^= rngS >> 12; rngS ^= rngS << 25; rngS ^= rngS >> 27;
-    return rngS * 0x2545F4914F6CDD1DULL;
-}
-
-static double rng_unif(void)        /* [0, 1) */
-{
-    return (double)(rng_next() >> 11) * (1.0 / 9007199254740992.0);
-}
 
 static int cmp_sakey(const void *p, const void *q)
 {
@@ -1937,7 +1890,7 @@ static int is_stalled(void)
 }
 
 /* the sweep has gone a while without gain: first try one discrepancy per
-   refill, then (if that stalls too) the randomized phase */
+   refill, then (if that stalls too) the threshold phase */
 static void stalled(void)
 {
     if (!ldsOn) { ldsOn = 1; lastImpOps = ops; lastImpStep = lnsSteps; }
@@ -2001,7 +1954,7 @@ static int lns_step(int t0, int t1, int v)
         long long from = (long long)t0 - maxWin;
         while (lo < h2) { int md = lo + (h2 - lo) / 2; if (U[md].arr < from) lo = md + 1; else h2 = md; }
         /* scan the arrival range (sequential) unless walking the unassigned list
-           (random access; about one in X / (region + window) entries fits) is cheaper */
+           (scattered reads; about one in X / (region + window) entries fits) is cheaper */
         if ((double)(hi - lo) <= 8.0 * lim * (double)X / ((double)(t1 - t0 + 1) + (double)lnsLavg) + 2000.0) {
             int base = nc;
             for (i = lo; i < hi; i++) {
@@ -2060,10 +2013,15 @@ static int lns_step(int t0, int t1, int v)
     if (saOn && saBuf) {
         for (i = 0; i < nc; i++) {
             int id = candList[i];
-            saBuf[i].k = (double)lpU[id] - saAlpha * (double)laU[id] + saNoise * (2.0 * rng_unif() - 1.0);
+            saBuf[i].k = (double)lpU[id] - saAlpha * (double)laU[id];
             saBuf[i].id = id;
         }
         qsort(saBuf, (size_t)nc, sizeof(SaKey), cmp_sakey);
+        if (nc > 1 && saPromote % nc) {        /* candidate j first, the others keep their order */
+            SaKey t = saBuf[saPromote % nc];
+            for (j = (int)(saPromote % nc); j > 0; j--) saBuf[j] = saBuf[j - 1];
+            saBuf[0] = t;
+        }
         for (i = 0; i < nc; i++) candList[i] = saBuf[i].id;
         ops += 20LL * nc;
     } else qsort(candList, (size_t)nc, sizeof(int), cmp_rank);
@@ -2265,18 +2223,17 @@ static void save_snapshot(void)
 }
 
 /*
- * Randomized phase: keep the refill just made although it lost profit (or
- * kept the profit with more area), with probability exp(-loss / temperature).
- * If the state before it was the best one, that state is saved first: the
- * current solution, with the refill's requests taken out and the removed
- * requests put back.
+ * Threshold phase: keep the refill just made although it lost profit (or kept
+ * the profit with more area) if the loss is at most the threshold.  If the
+ * state before it was the best one, that state is saved first: the current
+ * solution, with the refill's requests taken out and the removed requests put
+ * back.
  */
 static int sa_keep_worse(long long oldP, long long oldA, int nr, int na)
 {
     double loss = (double)(oldP - curProfit);
     int i;
-    if (loss <= 0) loss = 0.05 * saTemp;            /* same profit, more area */
-    if (loss > 30.0 * saTemp || rng_unif() >= my_exp(-loss / saTemp)) return 0;
+    if (saThr <= 0 || loss > saThr) return 0;
     if (bestIsCur) {
         size_t used;
         save_snapshot();
@@ -2369,7 +2326,19 @@ static int place_big(User *u)
 }
 
 static int longWhole;           /* the last first construction kept the long lookahead to the end */
-static double consLimit = 1e30; /* CPU seconds: the running construction stops here */
+/*
+ * Measured: on large inputs a construction takes more time per counted unit
+ * than the local search (it walks every request once, missing the cache), the
+ * more so with many requests and with many rows.  Its work is charged
+ * (1 + consExtra) times.
+ */
+#ifndef CONS_N
+#define CONS_N 0.5                  /* extra share at 200000 requests and more */
+#endif
+#ifndef CONS_W
+#define CONS_W 0.1                  /* extra share per doubling of the row words */
+#endif
+static double consExtra;
 static double loadRatio;        /* total smallest area of the requests / grid area */
 
 static int greedy(int v, long long budget, int mode)
@@ -2395,7 +2364,6 @@ static int greedy(int v, long long budget, int mode)
         lookMul = LONG_LOOK; longOn = 1; longOps = ops; longI = 0;
     }
     for (i = 0; i < nAss && ops - start <= budget; i++) {
-        if ((i & 255) == 0 && timeOn && cpu_now() > consLimit) break;   /* out of time */
         if (longOn && i < longEnd && (i & 63) == 0 && i - longI >= 256 && lookMul > LONG_MIN) {
             /* halve the lookahead while the rest of the core would not fit in the cap */
             double rate = (double)(ops - longOps) / (double)(i - longI);
@@ -2476,6 +2444,7 @@ static int greedy(int v, long long budget, int mode)
         {
             long long o0 = ops;
             placedNow += place_user(&U[order[v][i]]);
+            ops += (long long)((double)(ops - o0) * consExtra);   /* cache misses of large inputs */
             if (leanMode) {
                 /* measured: the cheap mode takes more time per counted unit */
                 ops += (ops - o0) * (LEAN_MUL4 - 4) / 4;
@@ -2488,10 +2457,7 @@ static int greedy(int v, long long budget, int mode)
     if (nBig > 0 && ops - start <= budget) {
         if (shDirty) refresh_dirty();
         leanMode = 0;
-        for (; bj < nBig && ops - start <= budget; bj++) {
-            if ((bj & 63) == 0 && timeOn && cpu_now() > consLimit) break;
-            placedNow += place_big(&U[bigIdx[bj]]);
-        }
+        for (; bj < nBig && ops - start <= budget; bj++) placedNow += place_big(&U[bigIdx[bj]]);
     }
     /* the planned pass pays off only if a real share went without lookahead */
     greedySwitched = firstFitUsers * 20 >= nAss;
@@ -2788,33 +2754,26 @@ static void lns_trace(long long lnsStart, int cycle)
 {
     static int nextTr = 1;
     if ((ops - lnsStart) * 20 >= (opsEnd - lnsStart) * nextTr) {
-        fprintf(stderr, "  lns %2d/20 profit=%lld area=%lld best=%lld steps=%lld lds=%d sa=%d T=%.3g cycle=%d | avg nr=%.1f nc=%.1f na=%.1f imp=%lld eq=%lld worse=%lld\n",
-                nextTr, curProfit, curArea, saOn ? bestP : curProfit, lnsSteps, ldsOn, saOn, saTemp, cycle,
+        fprintf(stderr, "  lns %2d/20 profit=%lld area=%lld best=%lld steps=%lld lds=%d ta=%d thr=%.3g pass=%d | avg nr=%.1f nc=%.1f na=%.1f imp=%lld eq=%lld worse=%lld\n",
+                nextTr, curProfit, curArea, saOn ? bestP : curProfit, lnsSteps, ldsOn, saOn, saThr, cycle,
                 (double)dgNr / (dgSteps + 1e-9), (double)dgNc / (dgSteps + 1e-9), (double)dgNa / (dgSteps + 1e-9), dgImp, dgEq, dgWorse);
         nextTr++;
     }
 }
 #endif
 
-#ifndef SA_T0
-#define SA_T0 0.1       /* starting temperature, in average profits of an accepted request */
+#ifndef TA_T0
+#define TA_T0 0.05      /* first threshold, in average profits of an accepted request */
 #endif
-#ifndef SA_T1
-#define SA_T1 0.003     /* final temperature, same unit */
-#endif
-#ifndef SA_NOISE
-#define SA_NOISE 1.0    /* most noise added to log(profit / area^alpha) */
-#endif
+static long long saStart, saStep;   /* start of the threshold phase, its steps */
+static double saThr0;
+static const double saAlphaTab[7] = {1.0, 0.6, 1.4, 0.8, 1.2, 0.7, 1.6};
 
-/*
- * Randomized phase until the end of the budget (see above).  Returns 0 if it
- * could not start (no memory).
- */
-static int sa_run(const int *widths, int nw)
+/* start of the threshold phase; returns 0 if it cannot start (no memory) */
+static int sa_begin(void)
 {
-    long long saStart = ops, nAss = 0;
-    double t0v, lr;
-    int i, nv = nVar < NVAR_LNS ? nVar : NVAR_LNS;
+    long long nAss = 0;
+    int i;
     lpU = (float *)malloc(sizeof(float) * ((size_t)N + 1));
     laU = (float *)malloc(sizeof(float) * ((size_t)N + 1));
     saBuf = (SaKey *)malloc(sizeof(SaKey) * ((size_t)N + 64));
@@ -2831,44 +2790,40 @@ static int sa_run(const int *widths, int nw)
         nAss += u->assigned;
     }
     ops += 80LL * N;
-    t0v = SA_T0 * (double)(curProfit > 0 ? curProfit : 1) / (double)(nAss > 0 ? nAss : 1);
-    lr = my_log(SA_T1 / SA_T0);
+    saThr0 = TA_T0 * (double)(curProfit > 0 ? curProfit : 1) / (double)(nAss > 0 ? nAss : 1);
+    saStart = ops;
+    saStep = 0;
     bestP = curProfit; bestA = curArea; bestIsCur = 1;
-    while (ops < opsEnd) {
-        double prog = (double)(ops - saStart) / (double)(opsEnd - saStart);
-        int j = (int)(rng_next() % 3), hb, v;
-        long long wd, t0, s0, s1, r0;
-        saTemp = t0v * my_exp(lr * prog);
-        hb = (int)(((long long)Y + (1LL << j) - 1) >> j);
-        wd = (long long)widths[rng_next() % (u64)nw] * (j ? 2 : 1);
-        if (wd > X) wd = X;
-        t0 = (long long)(rng_next() % (u64)(X + wd - 1)) - (wd - 1);
-        s0 = t0 < 0 ? 0 : t0;
-        s1 = t0 + wd - 1 > X - 1 ? X - 1 : t0 + wd - 1;
-        r0 = (long long)(rng_next() % (u64)(Y - hb + 1));
-        ry0 = (int)r0; ry1 = (int)(r0 + hb - 1);
-        saAlpha = 0.6 + rng_unif();
-        saNoise = SA_NOISE * rng_unif();
-        v = (int)(rng_next() % (u64)nv);
-        lns_step((int)s0, (int)s1, v);
-        lns_clock();
-#ifdef DIAG
-        lns_trace(lnsStart, -1);
-#endif
-    }
-    if (!bestIsCur && snapP >= 0) snapOut = 1;      /* answer: the best solution seen */
-#ifdef DIAG
-    fprintf(stderr, "  sa end: current %lld best %lld snapOut %d\n", curProfit, bestP, snapOut);
-#endif
     return 1;
+}
+
+/* before each refill of the threshold phase: threshold (falling linearly to
+   zero over the rest of the budget) and the next refill order in the cycle */
+static void sa_next(void)
+{
+    double left = opsEnd > saStart ? (double)(opsEnd - ops) / (double)(opsEnd - saStart) : 0;
+    saThr = left > 0 ? saThr0 * left : 0;
+    saAlpha = saAlphaTab[saStep % 7];
+    saPromote = saStep;
+    saStep++;
+}
+
+/* end of the threshold phase: the answer is the best solution seen */
+static void sa_end(void)
+{
+    if (!bestIsCur && snapP >= 0) snapOut = 1;
+#ifdef DIAG
+    fprintf(stderr, "  threshold phase end: current %lld best %lld snapOut %d\n", curProfit, bestP, snapOut);
+#endif
 }
 
 /*
  * Adaptive sweep.  A class is a region shape (row band height, strip width);
  * each class sweeps the grid with its own cursor (time strips, then row
  * bands, shifted on every new pass).  The work is cut into short segments and
- * each segment goes to a class chosen in proportion to the profit it gained
- * per unit of work recently (every class keeps a small share).
+ * the segments are shared out among the classes in proportion to the profit
+ * each gained per unit of work recently (smooth weighted round-robin; every
+ * class keeps a small share).
  */
 #ifndef SEG_DIV
 #define SEG_DIV 200                 /* a segment is about 1/SEG_DIV of the search budget */
@@ -2881,6 +2836,7 @@ typedef struct {
     int mode, hb, rstep, pass, seen;
     long long wd, step, t0, r0;
     double rate;                    /* recent profit gained per unit of work */
+    double credit;                  /* round-robin credit */
 } Cls;
 static Cls cls[NCLS];
 static int ncls;
@@ -2898,7 +2854,7 @@ static void cls_init(const int *widths, int nw)
             if (wd > X) wd = X;
             c->mode = mode; c->hb = hb; c->rstep = hb / 2 > 0 ? hb / 2 : 1;
             c->wd = wd; c->step = wd / 2 > 0 ? wd / 2 : 1;
-            c->pass = 0; c->seen = 0; c->rate = 0;
+            c->pass = 0; c->seen = 0; c->rate = 0; c->credit = 0;
             c->t0 = -c->step; c->r0 = 0;
         }
     }
@@ -2931,37 +2887,43 @@ static void cls_step(Cls *c, int v)
 
 static int cls_pick(void)
 {
-    double tot = 0, mx = 0, r;
-    int i;
+    double tot = 0, mx = 0;
+    int i, best = 0;
     for (i = 0; i < ncls; i++) if (!cls[i].seen) return i;     /* every class once, in order */
     for (i = 0; i < ncls; i++) if (cls[i].rate > mx) mx = cls[i].rate;
-    for (i = 0; i < ncls; i++) tot += cls[i].rate + CLS_FLOOR * mx + 1e-12;
-    r = rng_unif() * tot;
-    for (i = 0; i < ncls - 1; i++) {
-        r -= cls[i].rate + CLS_FLOOR * mx + 1e-12;
-        if (r < 0) break;
+    for (i = 0; i < ncls; i++) {
+        double w = (cls[i].rate > 0 ? cls[i].rate : 0) + CLS_FLOOR * mx + 1e-12;
+        cls[i].credit += w;
+        tot += w;
     }
-    return i;
+    for (i = 1; i < ncls; i++) if (cls[i].credit > cls[best].credit) best = i;
+    cls[best].credit -= tot;
+    return best;
 }
 
-/* the sweep, until the budget ends or the randomized phase starts */
-static void lns_sweep(int *vc)
+/* the sweep until the budget ends (the threshold phase starts on the way) */
+static void lns_sweep(void)
 {
     int nv = nVar < NVAR_LNS ? nVar : NVAR_LNS;
-    while (ops < opsEnd && !saOn) {
+    long long vc = 0;
+    while (ops < opsEnd) {
         int ci = cls_pick();
         Cls *c = &cls[ci];
         long long o0 = ops, p0 = curProfit, seg = (opsEnd - lnsStart) / SEG_DIV;
         double r;
         if (seg < 2000000) seg = 2000000;
         do {
-            cls_step(c, (*vc)++ % nv);
-            lns_clock();
+            if (saOn) sa_next();
+            cls_step(c, (int)(vc++ % nv));
+            lns_check();
 #ifdef DIAG
             lns_trace(lnsStart, c->pass);
 #endif
-            if (is_stalled()) stalled();
-        } while (ops - o0 < seg && ops < opsEnd && !saOn);
+            if (!saOn && is_stalled()) {
+                stalled();
+                if (saOn && !sa_begin()) { saOn = 0; saAllowed = 0; }   /* no memory: plain sweep */
+            }
+        } while (ops - o0 < seg && ops < opsEnd);
         r = (double)(curProfit - p0) / (double)(ops - o0 + 1);
         c->rate = c->seen ? 0.6 * c->rate + 0.4 * r : r;
         c->seen = 1;
@@ -2974,9 +2936,6 @@ int main(void)
     int i, y, v, maxK = 1;
     long long *bits;
 
-#ifndef NO_CLOCK
-    timeOn = cpu_now() >= 0;
-#endif
     for (i = 0; i < 4; i++) if (!read_ll(&hdr[i])) { print_empty(); return 0; }
     if (hdr[0] <= 0 || hdr[1] <= 0 || hdr[2] <= 0 || hdr[3] <= 0 ||
         hdr[0] > 2000000000LL || hdr[2] > 2000000000LL) {
@@ -3159,6 +3118,7 @@ int main(void)
         for (i = 0; i < N; i++) if (U[i].nopt > 0) dem += (double)U[i].minArea;
         loadRatio = dem / ((double)X * Y);
     }
+    consExtra = CONS_N * (N < 200000 ? (double)N / 200000.0 : 1.0) + CONS_W * ilog2(W);
     /* account for reading, option building and sorting */
     ops += inTotal * SETUP_PER_BYTE + (long long)N * nVar * 60;
 
@@ -3189,7 +3149,7 @@ int main(void)
         normEnd = base + normRest;
         /* a wider lookahead usually gains far more than the local search: it may
            use a little more than the normal budget */
-        wideRest = WIDE_LIMITV - ops;
+        wideRest = BUDGET(WIDE_LIMITV) - ops;
         if (wideRest < normRest) wideRest = normRest;
         if (wideRest > rest) wideRest = rest;
         wideEnd = base + wideRest;
@@ -3198,13 +3158,8 @@ int main(void)
         for (i = 0; i < N; i++) if (U[i].nopt + U[i].nbig > 0) allProfit += U[i].profit;
         ownLive = 0;                            /* only the local search needs owners */
         ownValid = 0;
-        double tPrev = 0;               /* CPU seconds of the last construction */
         for (ci = 0; ci < nCfg; ci++) {
             long long st = ops;
-            double tNow = timeOn ? cpu_now() : 0;
-            /* time: the next construction (up to 3.5 times the last one) must end by TIME_CONS */
-            if (ci > 0 && timeOn && tNow + tPrev * (ci == 3 ? 2.0 : 3.5) > TIME_CONS) break;
-            consLimit = ci == 0 ? TIME_FIRST : TIME_CONS;
             if (ci == 1 && (!switched || !cpValid || ops + cpTot * 12 / 10 > gEnd)) continue;
             if (ci == 2 && longWhole) continue;   /* the first one already had the long lookahead */
 #ifdef NO_WIDE
@@ -3226,10 +3181,9 @@ int main(void)
             r = greedy(0, (ci == 2 ? wideEnd : ci == 3 ? normEnd : gEnd) - ops, cfgMode[ci]);
             if (ci == 0) switched = greedySwitched;
 #ifdef DIAG
-            fprintf(stderr, "  config %d look=%d mode=%d complete=%d switched=%d profit=%lld cost=%.3g ops=%.3g cpu=%.2fs\n", ci, cfgL[ci], cfgMode[ci], r, greedySwitched, curProfit, (double)(ops - st), (double)ops, cpu_now());
+            fprintf(stderr, "  config %d look=%d mode=%d complete=%d switched=%d profit=%lld cost=%.3g ops=%.3g\n", ci, cfgL[ci], cfgMode[ci], r, greedySwitched, curProfit, (double)(ops - st), (double)ops);
 #endif
             prevCost = ops - st;
-            if (timeOn) tPrev = cpu_now() - tNow;
             lastC = ci;
             if (curProfit > gP || (curProfit == gP && curArea < gA)) {
                 gP = curProfit; gA = curArea; bestC = ci;
@@ -3238,9 +3192,7 @@ int main(void)
             if (!r) break;                      /* out of budget */
             if (curProfit >= allProfit) break;  /* everybody is served */
         }
-        /* a local search follows if work budget (or, with the clock, time) is left */
-        lnsWill = timeOn ? cpu_now() < TIME_LNS - 0.2 : ops < normEnd;
-        consLimit = 1e30;
+        lnsWill = ops < normEnd;                /* a local search follows */
         if (bestC >= 0 && bestC != lastC) {
             if (snapP >= 0 && !lnsWill) snapOut = 1;           /* no local search follows */
             else if (snapP >= 0) restore_snapshot();
@@ -3250,8 +3202,6 @@ int main(void)
         if (useOwn && !snapOut && lnsWill) { rebuild_owner(); ownValid = 1; }
         lookMul = LNS_LOOK;
         opsEnd = normEnd;
-        if (!lnsWill) opsEnd = ops < normEnd ? ops : normEnd;
-        else if (timeOn && opsEnd < ops + NORM_LIMIT / 20) opsEnd = ops + NORM_LIMIT / 20;   /* the clock corrects it */
         hardLimit = normEnd + (OPS_HARD - OPS_LIMIT) / 4;
         if (hardLimit < ops) hardLimit = ops;
         (void)cost0;
@@ -3277,7 +3227,7 @@ int main(void)
         }
         if (ops < opsEnd)
         {
-            int widths[10], nw = 0, vc = 0;
+            int widths[10], nw = 0;
             long long sumL = 0, cntL = 0, Lavg;
             for (i = 0; i < N; i++) if (U[i].nopt) { sumL += U[i].dl - U[i].arr + 1; cntL++; }
             Lavg = cntL ? sumL / cntL : X;
@@ -3308,14 +3258,9 @@ int main(void)
             lnsStart = ops;
             lastImpOps = ops; lastImpStep = lnsSteps;
             lnsStall = (opsEnd - lnsStart) / LDS_STALL;
-            if (timeOn) { lnsT0 = cpu_now(); lnsOps0 = ops; chkOps = ops; }
             cls_init(widths, nw);
-            for (;;) {
-                lns_sweep(&vc);
-                if (!saOn || ops >= opsEnd) break;
-                if (sa_run(widths, nw)) break;
-                saOn = 0; saAllowed = 0;        /* could not start: back to the sweep */
-            }
+            lns_sweep();
+            if (saOn) sa_end();
         }
     }
 
