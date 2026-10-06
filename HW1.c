@@ -2639,6 +2639,56 @@ static void comp_fail(void)
     X = 1;
 }
 
+/*
+ * Even windows cut to the widest shape do not fit in memory (very wide
+ * shapes): keep the requests with the best profit per area while their
+ * windows fit; the others cannot be served.  Returns the new count of
+ * cmpIdx (still in arrival order).
+ */
+static double *keepKey;
+
+static int cmp_keep(const void *p, const void *q)
+{
+    int a = *(const int *)p, b = *(const int *)q;
+    if (keepKey[a] != keepKey[b]) return keepKey[a] > keepKey[b] ? -1 : 1;
+    return (a > b) - (a < b);
+}
+
+static int comp_keep_best(int nIdx, long long cap, long long xlim)
+{
+    int *byKey = (int *)malloc(sizeof(int) * ((size_t)nIdx + 1)), i, n2 = 0;
+    char *keep = (char *)calloc((size_t)N + 1, 1);
+    long long tot = 0;
+    keepKey = (double *)malloc(sizeof(double) * ((size_t)N + 1));
+    if (!byKey || !keep || !keepKey) {          /* no memory: serve nobody */
+        for (i = 0; i < nIdx; i++) U[cmpIdx[i]].nopt = U[cmpIdx[i]].nbig = 0;
+        free(byKey); free(keep); free(keepKey); keepKey = 0;
+        return 0;
+    }
+    for (i = 0; i < nIdx; i++) {
+        const User *u = &U[cmpIdx[i]];
+        long long area = u->nopt > 0 ? u->minArea : (long long)u->optK[u->nopt] * S;
+        keepKey[cmpIdx[i]] = (double)u->profit / (double)(area > 0 ? area : 1);
+        byKey[i] = cmpIdx[i];
+    }
+    qsort(byKey, (size_t)nIdx, sizeof(int), cmp_keep);
+    for (i = 0; i < nIdx; i++) {
+        long long len = win_d(byKey[i]) - win_a(byKey[i]) + 1;
+        if (len > cap) len = cap;
+        if (tot + len + 1 > xlim) break;
+        tot += len + 1;
+        keep[byKey[i]] = 1;
+    }
+    for (i = 0; i < nIdx; i++) {
+        int id = cmpIdx[i];
+        if (keep[id]) cmpIdx[n2++] = id;
+        else U[id].nopt = U[id].nbig = 0;
+    }
+    free(byKey); free(keep); free(keepKey); keepKey = 0;
+    ops += (long long)nIdx * 40;
+    return n2;
+}
+
 static void compress_time(void)
 {
     int i, nIdx = 0, sorted = 1, maxW2 = 1, nUsed = 0;
@@ -2668,6 +2718,7 @@ static void compress_time(void)
             if (comp_len(nIdx, md, 0) <= xlim) lo = md; else hi = md - 1;
         }
         cap = lo;
+        if (comp_len(nIdx, cap, 0) > xlim) nIdx = comp_keep_best(nIdx, cap, xlim);
     } else if (!oA && full * 2 > X) {           /* little to gain: keep the axis */
         free(cmpIdx); cmpIdx = 0;
         return;
