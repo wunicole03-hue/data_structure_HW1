@@ -56,15 +56,6 @@ typedef unsigned long long u64;
 #define NORM_LIMITV 24000000000LL
 #endif
 #define BUDGET(v) (v)
-#ifndef FAST_SCALE
-#define FAST_SCALE 1.0
-#endif
-#ifndef SLOW_SCALE
-#define SLOW_SCALE 1.2
-#endif
-#ifndef MID_SCALE
-#define MID_SCALE 1.05
-#endif
 #define NORM_LIMIT BUDGET(NORM_LIMITV)
 #define OPS_LIMIT BUDGET(OPS_LIMITV)      /* soft work budget                   */
 #define OPS_HARD  (OPS_LIMIT + BUDGET(1100000000LL))      /* hard work budget                   */
@@ -3171,17 +3162,7 @@ int main(void)
     if (nsh > 0) {
         /* 1. initial greedy with each priority order */
         /* budgets are counted from here, so a costly setup never starves the search */
-        /*
-         * Budget by input class (judge measurements, same budget for all):
-         * grids of at most 64 rows with fewer than 100000 requests were
-         * already converged (25% more work changed no result), while grids of
-         * more than 64 rows kept improving and ran at most 10.7 s there.
-         * The latter get 1.2 times the work (about 12.8 s at most).
-         */
-        double budScale = W > 1 ? SLOW_SCALE : (N < 100000 ? FAST_SCALE : MID_SCALE);
-        long long opsLimit = (long long)((double)OPS_LIMIT * budScale);
-        long long normLimit = (long long)((double)NORM_LIMIT * budScale);
-        long long wideLimit = (long long)((double)BUDGET(WIDE_LIMITV) * budScale);
+        long long opsLimit = OPS_LIMIT, normLimit = NORM_LIMIT, wideLimit = BUDGET(WIDE_LIMITV);
         long long base = ops, rest = opsLimit - ops, gBudget, normRest, normEnd, cost0 = 0, wideRest, wideEnd;
         /* portfolio of constructions: (priority order, lookahead); extra ones only while cheap */
         /* constructions:
