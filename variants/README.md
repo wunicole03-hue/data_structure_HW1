@@ -41,3 +41,18 @@ mixing in the cheap mode slightly hurts.
 | Q_lean_early.c | cheap mode after one over-budget checkpoint (was two) |
 | R_lean_late.c | cheap mode after three over-budget checkpoints |
 | T_ops52.c | OPS_LIMITV 50e9 -> 52e9 (about +0.5 s on the slowest test) |
+
+Judge totals (round 3): O 2,359,084 · P 2,359,084 · Q 2,360,158 · R 2,357,611 ·
+T 2,363,342 (max time under 13.6 s).  The local-search lookahead changes nothing
+(the judge's score comes from the construction); switching to the cheap mode
+earlier helps, later hurts; more budget helps.
+
+## Round 4 (built on I)
+
+| File | Change |
+|---|---|
+| U_lean1_ops52.c | Q + T: cheap mode after one over-budget checkpoint, OPS_LIMITV 52e9 |
+| V_noback.c | U + never leaves the cheap mode once in it |
+| W_need100.c | U + the first budget projection without the 0.85 discount (switches earlier) |
+| X_leanmul4.c | U + cheap-mode work charged 1x (was 1.25x): more requests reached, more time |
+| Y_ops54.c | U + OPS_LIMITV 54e9 (more time) |
