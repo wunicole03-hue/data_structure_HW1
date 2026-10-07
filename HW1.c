@@ -56,6 +56,12 @@ typedef unsigned long long u64;
 #define NORM_LIMITV 24000000000LL
 #endif
 #define BUDGET(v) (v)
+#ifndef FAST_SCALE
+#define FAST_SCALE 1.25
+#endif
+#ifndef MID_SCALE
+#define MID_SCALE 1.05
+#endif
 #define NORM_LIMIT BUDGET(NORM_LIMITV)
 #define OPS_LIMIT BUDGET(OPS_LIMITV)      /* soft work budget                   */
 #define OPS_HARD  (OPS_LIMIT + BUDGET(1100000000LL))      /* hard work budget                   */
@@ -3162,7 +3168,17 @@ int main(void)
     if (nsh > 0) {
         /* 1. initial greedy with each priority order */
         /* budgets are counted from here, so a costly setup never starves the search */
-        long long base = ops, rest = OPS_LIMIT - ops, gBudget, normRest, normEnd, cost0 = 0, wideRest, wideEnd;
+        /*
+         * Measured: per counted unit, grids of at most 64 rows (one word per
+         * column) with fewer than 100000 requests run up to about 1.35 times
+         * faster than the slowest inputs (more rows, or many requests), which
+         * set the time limit.  They get proportionally more budget.
+         */
+        double budScale = W > 1 ? 1.0 : (N < 100000 ? FAST_SCALE : MID_SCALE);
+        long long opsLimit = (long long)((double)OPS_LIMIT * budScale);
+        long long normLimit = (long long)((double)NORM_LIMIT * budScale);
+        long long wideLimit = (long long)((double)BUDGET(WIDE_LIMITV) * budScale);
+        long long base = ops, rest = opsLimit - ops, gBudget, normRest, normEnd, cost0 = 0, wideRest, wideEnd;
         /* portfolio of constructions: (priority order, lookahead); extra ones only while cheap */
         /* constructions:
              1. wide lookahead; if it is projected not to reach every request, the
@@ -3176,17 +3192,17 @@ int main(void)
         static const int cfgMode[] = {GR_TRY, GR_PLANNED, GR_PLAIN, GR_PLAIN};
         int nCfg = (int)(sizeof(cfgL) / sizeof(cfgL[0])), ci, bestC = -1, lastC = -1, r, switched = 0, wideLook = 32, lnsWill;
         long long gP = -1, gA = 0, gEnd, prevCost = 0;
-        if (rest < OPS_LIMIT / 3) rest = OPS_LIMIT / 3;   /* the greedy always gets a share */
+        if (rest < opsLimit / 3) rest = opsLimit / 3;   /* the greedy always gets a share */
         gBudget = rest * 97 / 100;
         gEnd = base + gBudget;
         /* extra constructions and the local search stay within the normal budget */
-        normRest = NORM_LIMIT - ops;
-        if (normRest < NORM_LIMIT / 3) normRest = NORM_LIMIT / 3;
+        normRest = normLimit - ops;
+        if (normRest < normLimit / 3) normRest = normLimit / 3;
         if (normRest > rest) normRest = rest;
         normEnd = base + normRest;
         /* a wider lookahead usually gains far more than the local search: it may
            use a little more than the normal budget */
-        wideRest = BUDGET(WIDE_LIMITV) - ops;
+        wideRest = wideLimit - ops;
         if (wideRest < normRest) wideRest = normRest;
         if (wideRest > rest) wideRest = rest;
         wideEnd = base + wideRest;
