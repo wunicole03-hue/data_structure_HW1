@@ -98,7 +98,7 @@ typedef unsigned long long u64;
 #define LONG_CORE100 100            /* ...for the leading requests whose smallest areas fill this % of the grid */
 #endif
 #ifndef LONG_FRAC100
-#define LONG_FRAC100 50             /* ...while it has used at most this % of the budget */
+#define LONG_FRAC100 75             /* ...while it has used at most this % of the budget */
 #endif
 #ifndef LOOK_MULV
 #define LOOK_MULV 4
