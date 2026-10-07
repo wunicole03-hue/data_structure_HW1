@@ -27,3 +27,17 @@ E 2,352,756 · F 1,789,122 · G 2,352,756 · H 2,357,582 (best).
 | L_mixed_look3.c | + first-construction lookahead 3 |
 | M_mixed_look1.c | + first-construction lookahead 1 |
 | N_mixed_look2_wide_lean.c | I + J + K together |
+
+Judge totals (round 2): I 2,359,084 (best) · J 2,349,412 · K 2,356,962 · L 2,358,493 ·
+M 2,355,083 · N 2,352,428.  Lookahead 2 is best (3 close, 1 worse); wider mixing hurts;
+mixing in the cheap mode slightly hurts.
+
+## Round 3 (all built on I_mixed_look2.c)
+
+| File | Change on top of I |
+|---|---|
+| O_lnslook2.c | local-search lookahead 4 -> 2 |
+| P_lnslook8.c | local-search lookahead 4 -> 8 |
+| Q_lean_early.c | cheap mode after one over-budget checkpoint (was two) |
+| R_lean_late.c | cheap mode after three over-budget checkpoints |
+| T_ops52.c | OPS_LIMITV 50e9 -> 52e9 (about +0.5 s on the slowest test) |
