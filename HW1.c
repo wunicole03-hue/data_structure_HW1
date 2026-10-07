@@ -2866,6 +2866,9 @@ static void sa_end(void)
 #define SEG_DIV 200                 /* a segment is about 1/SEG_DIV of the search budget */
 #endif
 #define NCLS 64
+#ifndef NARROW
+#define NARROW 1
+#endif
 #ifndef MIN_BAND
 #define MIN_BAND 8                  /* thinnest extra row band */
 #endif
@@ -3270,13 +3273,13 @@ int main(void)
         }
         if (ops < opsEnd)
         {
-            int widths[10], nw = 0;
+            int widths[12], nw = 0;
             long long sumL = 0, cntL = 0, Lavg;
             for (i = 0; i < N; i++) if (U[i].nopt) { sumL += U[i].dl - U[i].arr + 1; cntL++; }
             Lavg = cntL ? sumL / cntL : X;
             lnsLavg = Lavg > 0 ? Lavg : 1;
             {
-                long long cand[8], nAs = 0, maxW;
+                long long cand[10], nAs = 0, maxW;
                 int c, nc0;
                 /* a full-height strip holds at most about REG_USERS average requests */
                 for (i = 0; i < N; i++) nAs += U[i].assigned;
@@ -3288,6 +3291,7 @@ int main(void)
                 cand[6] = maxW / 4; cand[7] = maxW / 2;     /* only if some width was cut */
                 nc0 = 6;
                 for (c = 0; c < 6; c++) if (cand[c] > maxW) { cand[c] = maxW; nc0 = 8; }
+                if (NARROW) { cand[nc0++] = S / 2; cand[nc0++] = S / 4; }   /* narrow strips */
                 for (c = 0; c < nc0; c++) {
                     long long w = cand[c];
                     int dup = 0, q2;
