@@ -57,7 +57,10 @@ typedef unsigned long long u64;
 #endif
 #define BUDGET(v) (v)
 #ifndef FAST_SCALE
-#define FAST_SCALE 1.25
+#define FAST_SCALE 1.0
+#endif
+#ifndef SLOW_SCALE
+#define SLOW_SCALE 1.2
 #endif
 #ifndef MID_SCALE
 #define MID_SCALE 1.05
@@ -3169,12 +3172,13 @@ int main(void)
         /* 1. initial greedy with each priority order */
         /* budgets are counted from here, so a costly setup never starves the search */
         /*
-         * Measured: per counted unit, grids of at most 64 rows (one word per
-         * column) with fewer than 100000 requests run up to about 1.35 times
-         * faster than the slowest inputs (more rows, or many requests), which
-         * set the time limit.  They get proportionally more budget.
+         * Budget by input class (judge measurements, same budget for all):
+         * grids of at most 64 rows with fewer than 100000 requests were
+         * already converged (25% more work changed no result), while grids of
+         * more than 64 rows kept improving and ran at most 10.7 s there.
+         * The latter get 1.2 times the work (about 12.8 s at most).
          */
-        double budScale = W > 1 ? 1.0 : (N < 100000 ? FAST_SCALE : MID_SCALE);
+        double budScale = W > 1 ? SLOW_SCALE : (N < 100000 ? FAST_SCALE : MID_SCALE);
         long long opsLimit = (long long)((double)OPS_LIMIT * budScale);
         long long normLimit = (long long)((double)NORM_LIMIT * budScale);
         long long wideLimit = (long long)((double)BUDGET(WIDE_LIMITV) * budScale);
