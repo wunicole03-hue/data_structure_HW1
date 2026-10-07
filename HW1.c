@@ -2865,7 +2865,10 @@ static void sa_end(void)
 #ifndef SEG_DIV
 #define SEG_DIV 200                 /* a segment is about 1/SEG_DIV of the search budget */
 #endif
-#define NCLS 32
+#define NCLS 64
+#ifndef MIN_BAND
+#define MIN_BAND 8                  /* thinnest extra row band */
+#endif
 #ifndef CLS_FLOOR
 #define CLS_FLOOR 0.05
 #endif
@@ -2882,8 +2885,10 @@ static void cls_init(const int *widths, int nw)
 {
     int mode, wi;
     ncls = 0;
-    for (mode = 0; mode < 3; mode++) {
-        int hb = (int)(((long long)Y + (1LL << mode) - 1) >> mode);   /* Y, Y/2, Y/4 */
+    /* row bands Y, Y/2, Y/4, and on tall grids thinner ones down to MIN_BAND rows */
+    for (mode = 0; mode < 8; mode++) {
+        int hb = (int)(((long long)Y + (1LL << mode) - 1) >> mode);
+        if (mode >= 3 && hb < MIN_BAND) break;
         if (mode > 0 && hb >= Y) continue;
         for (wi = 0; wi < nw && ncls < NCLS; wi++) {
             Cls *c = &cls[ncls++];
