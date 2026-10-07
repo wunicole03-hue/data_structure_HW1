@@ -104,9 +104,6 @@ typedef unsigned long long u64;
 #define LOOK_MULV 4
 #endif
 #define LOOK_MUL  LOOK_MULV                /* lookahead (in RB widths) after the first fit */
-#ifndef LOOK_FLOOR
-#define LOOK_FLOOR 1                /* over budget, the first construction halves its lookahead down to this */
-#endif
 #ifndef LNS_LOOK
 #define LNS_LOOK LOOK_MUL           /* lookahead of the local search refills */
 #endif
@@ -2400,13 +2397,7 @@ static int greedy(int v, long long budget, int mode)
 #ifdef FORCE_LEAN
             leanMode = 1;
 #else
-            if (!leanMode) {
-                if (overCnt >= 2) {
-                    /* over budget: shorter lookahead first, the cheap mode last */
-                    if (lookMul > LOOK_FLOOR) { lookMul /= 2; overCnt = 0; rateW = 0; }
-                    else leanMode = 1;
-                }
-            }
+            if (!leanMode) { if (overCnt >= 2) leanMode = 1; }
             else if (need <= (fits ? 0.9 : 1.0) * (double)budget) { leanMode = 0; refresh_dirty(); }
 #endif
             if (leanMode) update_lean_keep(nAss);
