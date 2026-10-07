@@ -47,13 +47,13 @@ typedef unsigned long long u64;
 #define NVAR 9                      /* number of priority orders          */
 #define MAXSH 32                    /* shapes kept (bitmask in unsigned)  */
 #ifndef OPS_LIMITV
-#define OPS_LIMITV 40000000000LL
+#define OPS_LIMITV 50000000000LL
 #endif
 #ifndef WIDE_LIMITV
 #define WIDE_LIMITV 15000000000LL   /* the wider-lookahead construction may run up to here */
 #endif
 #ifndef NORM_LIMITV
-#define NORM_LIMITV 30000000000LL
+#define NORM_LIMITV 24000000000LL
 #endif
 #define BUDGET(v) (v)
 #define NORM_LIMIT BUDGET(NORM_LIMITV)
