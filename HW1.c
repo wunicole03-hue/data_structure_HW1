@@ -2863,7 +2863,7 @@ static void sa_end(void)
  * class keeps a small share).
  */
 #ifndef SEG_DIV
-#define SEG_DIV 200                 /* a segment is about 1/SEG_DIV of the search budget */
+#define SEG_DIV 800                 /* a segment is about 1/SEG_DIV of the search budget */
 #endif
 #define NCLS 64
 #ifndef NARROW
