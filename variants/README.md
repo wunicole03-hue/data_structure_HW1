@@ -75,3 +75,12 @@ budget is short, unchanged elsewhere; a few extreme cases -0.2% to -0.7%.
 
 Own tests: oversubscribed large inputs +4% to +16%, inputs with many big users +8% to +30%,
 budget-bound runs never worse; small inputs mean +0.7% to +1.0% (a few -1% to -6%).
+
+## Faster setup (built on R_ratio50.c)
+
+| File | Change |
+|---|---|
+| S_fast50.c | rows grouped by bit value without sorting (small values), fewer buffer checks in the parser; same output as R_ratio50.c, setup 2x-4x faster on tall grids |
+| S_fast52.c | the same with OPS_LIMITV 52e9 |
+| S_fast50_r12.c | S_fast50 with options limited to 1.2x the fewest RBs |
+| S_fast50_r20.c | S_fast50 with options limited to 2x the fewest RBs |
