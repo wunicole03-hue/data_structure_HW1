@@ -56,3 +56,12 @@ earlier helps, later hurts; more budget helps.
 | W_need100.c | U + the first budget projection without the 0.85 discount (switches earlier) |
 | X_leanmul4.c | U + cheap-mode work charged 1x (was 1.25x): more requests reached, more time |
 | Y_ops54.c | U + OPS_LIMITV 54e9 (more time) |
+
+## Pacing (built on the tidied T_ops52.c)
+
+| File | Change |
+|---|---|
+| P_pace.c | budget projection of the first construction counts successful placements (they carry the cost and stop once the grid is full) instead of a flat rate per user |
+
+Own budget-bound runs (no long lookahead, no local search): +4% to +10% where the
+budget is short, unchanged elsewhere; a few extreme cases -0.2% to -0.7%.
