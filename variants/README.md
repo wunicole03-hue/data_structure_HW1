@@ -65,3 +65,13 @@ earlier helps, later hurts; more budget helps.
 
 Own budget-bound runs (no long lookahead, no local search): +4% to +10% where the
 budget is short, unchanged elsewhere; a few extreme cases -0.2% to -0.7%.
+
+## Option limits (built on the tidied T_ops52.c)
+
+| File | Change |
+|---|---|
+| R_ratio48.c | users needing more than 64 RBs keep up to 6 options (was 2: fewest RBs and most rows); when the demand exceeds the grid, an option needing more than 1.5x the RBs of the user's cheapest one is not used; OPS_LIMITV 48e9 (real time per counted unit is up to ~9% higher) |
+| R_ratio50.c | the same with OPS_LIMITV 50e9 (riskier on time) |
+
+Own tests: oversubscribed large inputs +4% to +16%, inputs with many big users +8% to +30%,
+budget-bound runs never worse; small inputs mean +0.7% to +1.0% (a few -1% to -6%).
