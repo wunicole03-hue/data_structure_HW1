@@ -44,13 +44,14 @@ typedef long long ll;
 #define OPT_DEN 2
 #define OPT_ADD 1
 /*
- * Total work budget in 0.1 ns units (about 6 s with optimisation).  A build
- * without optimisation runs up to 4 times slower per unit, so it gets less.
+ * Total work budget in 0.1 ns units (about 4.5 s with optimisation).  A
+ * build without optimisation runs up to 4 times slower per unit, so it gets
+ * less.
  */
 #ifdef __OPTIMIZE__
-#define WORK_LIMIT 60000000000LL
+#define WORK_LIMIT 45000000000LL
 #else
-#define WORK_LIMIT 25000000000LL
+#define WORK_LIMIT 20000000000LL
 #endif
 #define WORK_HARD (WORK_LIMIT + WORK_LIMIT / 20)   /* no placement goes past this */
 #define MAXEVAL 1000000         /* most spots scored per RB               */
@@ -140,7 +141,8 @@ static double memG;                 /* log2(working set / 8 MB), >= 0 */
 static void set_weights(const double w[15][2]) {
     int k;
     for (k = 0; k < 15; k++) {
-        opW[k] = (ll)(10.0 * (w[k][0] + w[k][1] * memG) + 0.5);
+        /* large working sets: every step is somewhat slower (cache misses) */
+        opW[k] = (ll)(10.0 * (w[k][0] + w[k][1] * memG) * (1.0 + 0.1 * memG) + 0.5);
         if (opW[k] < 1) opW[k] = 1;
     }
 }
@@ -703,6 +705,7 @@ static void build_options(int u, const int *bits, int *vals) {
         if (cntVal[v]++ == 0) vals[nv++] = v;
     }
     qsort(vals, nv, sizeof(int), cmp_desc_int);
+    OPS(K_SETUP, 4LL * nv);
     {
         int rows = 0;
         for (i = 0; i < nv; i++) {
@@ -1305,7 +1308,9 @@ static const double alphas[5] = { 1.0, 0.85, 1.15, 0.7, 1.3 };
 
 static void local_search(void) {
     int target = TARGET, pass, nLev = 0, l, tw[NLEV], hb[NLEV], u, nAsg = 0;
-    ll start = ops, span = WORK_LIMIT - ops, thr0;
+    /* the output (about 40 ns per RB) is written after the search */
+    ll lsEnd = WORK_LIMIT - 400 * (usedArea / (S > 0 ? S : 1)) - 200LL * N;
+    ll start = ops, span = lsEnd - ops, thr0;
     if (Xc <= 0 || span <= 0) return;
     build_classes();
     build_trees();
@@ -1325,7 +1330,7 @@ static void local_search(void) {
         if (tw[l] > Xc) tw[l] = Xc;
         nLev++;
     }
-    for (pass = 0; ops < WORK_LIMIT; pass++) {
+    for (pass = 0; ops < lsEnd; pass++) {
         int lv = pass % nLev, h = hb[lv], left = 0, yoff, y0, x0;
         for (u = 0; u < N; u++) if (U[u].no && !U[u].asg) left++;
         OPS(K_RUIN, N);
@@ -1336,9 +1341,9 @@ static void local_search(void) {
         }
         yoff = ((pass / nLev) & 1) ? h / 2 : 0;
         curAlpha = alphas[(pass / nLev) % 5];
-        for (y0 = (yoff ? -yoff : 0); y0 < Y && ops < WORK_LIMIT; y0 += h) {
+        for (y0 = (yoff ? -yoff : 0); y0 < Y && ops < lsEnd; y0 += h) {
             int ya = y0 < 0 ? 0 : y0, yb = y0 + h - 1 < Y ? y0 + h - 1 : Y - 1;
-            for (x0 = 0; x0 < Xc && ops < WORK_LIMIT; ) {
+            for (x0 = 0; x0 < Xc && ops < lsEnd; ) {
                 int x1 = x0 + tw[lv] - 1, r;
                 double left = 1.0 - (double)(ops - start) / span;
                 ll thr = pass < nLev ? 0 : (ll)(thr0 * (left - 0.2) / 0.8);
@@ -1386,6 +1391,7 @@ int main(void) {
     tO = malloc(sizeof(u64) * W); tN = malloc(sizeof(u64) * W);
     if (!occ || !cHead || !tA || !tP || !tT || !tQ || !tO || !tN) exit(1);
     for (c = 0; c <= Xc; c++) cHead[c] = -1;
+    OPS(K_SCAN, (ll)Xc * (W + 3));
     spot_init();
     fen_init();
     {   /* working set in bytes -> memory factor of the weights */
