@@ -3,25 +3,33 @@
  * 2D Resource Allocation Problem with NR (multi-numerology)
  *
  * Grid: Y rows (frequency) x X columns (time).  A resource block (RB) is an
- * h x w rectangle with h * w = S.  A user u with threshold b may use only the
- * rows whose bits are >= b, and then needs k = ceil(D / (S * b)) RBs inside
- * its time window [arr, dl].  All RBs of one user have the same shape here,
- * so the "same shape when overlapping in time" rule always holds.
+ * h x w rectangle with h * w = S.  With a bit threshold b a user may use only
+ * the rows whose bits are >= b and needs k = ceil(D / (S * b)) RBs inside its
+ * time window [arr, dl].  RBs of one user that overlap in time have the same
+ * shape.  Goal: the largest total profit of the served users.
  *
  * Method
- *   1. Options: for every user, the useful thresholds b (fewest RBs first).
- *   2. Placement of one user: for every option and every shape, RBs are put
- *      one by one at the earliest feasible column; within a short lookahead
- *      the spot touching the most occupied cells / borders is taken.  The
- *      shape with the best contact ratio wins; the first option that fits
- *      is used.
- *   3. Greedy construction: users by profit per area, best first.
- *   4. Local search (ruin and recreate): a time strip is emptied, the removed
- *      users and the best unserved users overlapping it are re-inserted
- *      greedily; the change is kept if the profit does not drop.
+ *   1. Options: for every user the useful thresholds b, fewest RBs first.
+ *      Columns that no window covers are removed.
+ *   2. Placement of one user (place_user): for the first option that fits,
+ *      every shape is tried.  RBs are put one by one: from the earliest
+ *      column where the shape fits, a lookahead of a few RB widths is
+ *      searched for the spot touching the most occupied cells / borders.
+ *      The shape with the best contact ratio wins.  If no shape fits all k
+ *      RBs, a second shape is used for the rest at other times.
+ *      Per-shape bitsets of columns where a free spot may start skip the
+ *      full parts of the grid quickly.
+ *   3. Construction: greedy by profit / area^alpha for a few alpha, then
+ *      "squeaky wheel" rounds (users left out move up in the order).
+ *      The best solution is kept.
+ *   4. Local search (ruin and recreate): the RBs inside a rectangle (time
+ *      strip x row band) are taken out; the touched users and the best
+ *      unserved users overlapping the strip are put back greedily.  The
+ *      change is kept if the profit does not drop (or, early on, drops by
+ *      less than a shrinking threshold; the best solution is kept).
  *
  * The program is deterministic: no random numbers and no clock.  Run time is
- * bounded by a counter of elementary work steps (ops).
+ * bounded by a work counter whose weights were fitted to measured run times.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,26 +39,14 @@ typedef unsigned long long u64;
 typedef long long ll;
 
 #define MAXSH   64              /* most shapes (divisors of S)            */
-#ifndef MAXOPT
 #define MAXOPT  6               /* most options kept per user             */
-#endif
-#ifndef OPT_NUM                 /* options need at most NUM/DEN * kmin + ADD RBs */
 #define OPT_NUM 3
 #define OPT_DEN 2
 #define OPT_ADD 1
-#endif
-#ifndef WORK_LIMIT
-#define WORK_LIMIT 80000000000LL   /* total work budget (0.1 ns units)        */
-#endif
-#ifndef MAXEVAL
+#define WORK_LIMIT 88000000000LL   /* total work budget (0.1 ns units)        */
 #define MAXEVAL 1000000         /* most spots scored per RB               */
-#endif
-#ifndef LA_MIN
 #define LA_MIN 32               /* ...but at least this many columns       */
-#endif
-#ifndef LA_MUL
 #define LA_MUL 8                /* lookahead after the first fit, in RB widths */
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Input                                                              */
@@ -139,25 +135,7 @@ static void set_weights(const double w[15][2]) {
         if (opW[k] < 1) opW[k] = 1;
     }
 }
-#ifdef CALIB
-#include <time.h>
-static ll cnt[16];
-static void calib_mark(const char *ph) {
-    int k;
-    fprintf(stderr, "PH %s %.4f", ph, (double)clock() / CLOCKS_PER_SEC);
-    fprintf(stderr, " %d %d %d %d", N, Xc, W, nOpt);
-    for (k = 0; k < 15; k++) fprintf(stderr, " %lld", cnt[k]);
-    fprintf(stderr, "\n");
-}
-#define CALIB_MARK(ph) calib_mark(ph)
-#else
-#define CALIB_MARK(ph)
-#endif
-#ifdef CALIB
-#define OPS(k, v) do { ll v_ = (v); ops += v_ * opW[k]; cnt[k] += v_; } while (0)
-#else
 #define OPS(k, v) (ops += (v) * opW[k])
-#endif
 static ll totalProfit;
 static ll usedArea;
 
@@ -220,7 +198,7 @@ static void runs_words(const u64 *A, int h, u64 *P) {
         shr_words(P, st, tT);
         for (j = 0; j < W; j++) P[j] &= tT[j];
         len += st;
-        OPS(10, 2 * (W + 2));
+        OPS(K_CANDW, 2 * (W + 2));
     }
 }
 
@@ -246,19 +224,19 @@ static void set_rect(int y, int x, int s, int on) {
         if (on) for (c = 0; c < w; c++, p += W) *p |= m;
         else    for (c = 0; c < w; c++, p += W) *p &= ~m;
     }
-    OPS(0, w * (j1 - j0 + 1) + 4);
+    OPS(K_MARK, w * (j1 - j0 + 1) + 4);
 }
 
 /* Fenwick tree over columns: free cells (committed placements only) */
 static ll *fen;
 
 static void fen_add(int x, ll v) {
-    for (x++; x <= Xc; x += x & -x) { fen[x] += v; OPS(13, 1); }
+    for (x++; x <= Xc; x += x & -x) { fen[x] += v; OPS(K_FEN, 1); }
 }
 
 static ll fen_sum(int x) {          /* free cells in columns [0, x) */
     ll r = 0;
-    for (; x > 0; x -= x & -x) { r += fen[x]; OPS(13, 1); }
+    for (; x > 0; x -= x & -x) { r += fen[x]; OPS(K_FEN, 1); }
     return r;
 }
 
@@ -275,7 +253,7 @@ static void fen_init(void) {
 static void fen_rect(int x, int s, int sign) {
     int c;
     for (c = 0; c < shW[s]; c++) fen_add(x + c, (ll)sign * shH[s]);
-    OPS(0, shW[s]);
+    OPS(K_MARK, shW[s]);
 }
 
 /* number of occupied cells in rows [y, y + h) of column c */
@@ -313,7 +291,7 @@ static int candidates(int x, int h, int w, const u64 *M) {
             a &= ~q[c];
             if (!a) break;
         }
-        OPS(1, c + 1);
+        OPS(K_CAND, c + 1);
         if (!a) return 0;
         p = runs1(a, h);
         if (!p) return 0;
@@ -331,7 +309,7 @@ static int candidates(int x, int h, int w, const u64 *M) {
         }
         if (!any) break;
     }
-    OPS(10, (c + 1) * (W + 2));
+    OPS(K_CANDW, (c + 1) * (W + 2));
     if (!any) return 0;
     runs_words(tA, h, tP);
     any = 0;
@@ -343,7 +321,7 @@ static int candidates(int x, int h, int w, const u64 *M) {
         u64 up = (tA[j] << 1) | (j ? tA[j - 1] >> 63 : 0);
         tP[j] &= ~up | ~tQ[j];
     }
-    OPS(10, 4 * (W + 2));
+    OPS(K_CANDW, 4 * (W + 2));
     return 1;
 }
 
@@ -354,7 +332,7 @@ static int row_contact(int r, int x, int w) {
     if (tN[r >> 6] & b) return w;
     if (!(tO[r >> 6] & b)) return 0;
     for (c = 0; c < w; c++) n += cell(x + c, r);
-    OPS(2, w);
+    OPS(K_CONTACT, w);
     return n;
 }
 
@@ -365,7 +343,7 @@ static int contact(int y, int x, int h, int w) {
     n += (x + w == Xc || wallL[x + w]) ? h : col_count(x + w, y, h);
     n += (y == 0) ? w : row_contact(y - 1, x, w);
     n += (y + h == Y) ? w : row_contact(y + h, x, w);
-    OPS(2, 6);
+    OPS(K_CONTACT, 6);
     return n;
 }
 
@@ -383,7 +361,7 @@ static int spot_at(int s, int x) {
         u64 a = (Y == 64) ? ~0ULL : ((1ULL << Y) - 1);
         const u64 *q = occ + x;
         for (c = 0; c < w && a; c++) a &= ~q[c];
-        OPS(3, c + 2);
+        OPS(K_SPOT, c + 2);
         return runs1(a, h) != 0;
     }
     for (j = 0; j < W; j++) tA[j] = row_mask(j, 0, Y);
@@ -391,9 +369,9 @@ static int spot_at(int s, int x) {
         const u64 *q = occ + (size_t)(x + c) * W;
         u64 any = 0;
         for (j = 0; j < W; j++) { tA[j] &= ~q[j]; any |= tA[j]; }
-        if (!any) { OPS(11, (c + 1) * (W + 2)); return 0; }
+        if (!any) { OPS(K_SPOTW, (c + 1) * (W + 2)); return 0; }
     }
-    OPS(11, (w + 4) * (W + 2));
+    OPS(K_SPOTW, (w + 4) * (W + 2));
     runs_words(tA, h, tQ);
     for (j = 0; j < W; j++) if (tQ[j]) return 1;
     return 0;
@@ -417,7 +395,7 @@ static void spot_update(int x0, int x1, int how) {
             if (spot_at(s, x)) *wd |= b;
             else *wd &= ~b;
         }
-        OPS(4, hi - lo + 1);
+        OPS(K_SCAN, hi - lo + 1);
     }
 }
 
@@ -431,7 +409,7 @@ static int next_spot(int s, int x, int last) {
     while (!m) {
         if (++i > e) return last + 1;
         m = spot[s][i];
-        OPS(4, 1);
+        OPS(K_SCAN, 1);
     }
     x = 64 * i + lowest_bit(m);
     return x <= last ? x : last + 1;
@@ -469,7 +447,7 @@ static void add_rb(int u, int y, int x, int s) {
     else { if (nodeTop == nodeCap) grow_nodes(); id = nodeTop++; }
     nY[id] = y; nX[id] = x; nS[id] = s; nU[id] = u;
     nNext[id] = U[u].first; U[u].first = id; U[u].nrb++;
-    OPS(9, 1);
+    OPS(K_NODE, 1);
     cPrev[id] = -1; cNext[id] = cHead[x];
     if (cHead[x] >= 0) cPrev[cHead[x]] = id;
     cHead[x] = id;
@@ -498,7 +476,7 @@ static void remove_user(int u) {
         else cHead[nX[id]] = cNext[id];
         if (cNext[id] >= 0) cPrev[cNext[id]] = cPrev[id];
         nNext[id] = freeNode; freeNode = id;
-        OPS(9, 1);
+        OPS(K_NODE, 1);
         id = nx;
     }
     U[u].first = -1;
@@ -573,9 +551,6 @@ static ll trial(int s, int k, const u64 *M, int ca, int cb) {
     return r == k ? sum : -1;
 }
 
-#ifndef MIXED
-#define MIXED 1
-#endif
 /*
  * Two shapes for one user: the r1 blocks of shape s1 that fit, then the
  * other k - r1 blocks with another shape strictly after (or before) them in
@@ -615,7 +590,7 @@ static int place_user(int u, int ca, int cb) {
     ll freeCells;
     if (L < minW) return 0;
     freeCells = fen_sum(cb + 1) - fen_sum(ca);
-    OPS(5, 1);
+    OPS(K_PLACE, 1);
     for (o = p->o0; o < p->o0 + p->no && o < p->o0 + maxOpt; o++) {
         int k = oK[o], bestS = -1, r, partS = -1, partR = 0;
         ll bestNum = 0, bestDen = 1;
@@ -625,7 +600,7 @@ static int place_user(int u, int ca, int cb) {
         for (s = 0; s < nsh && !(firstShape && bestS >= 0); s++) {
             ll c, den;
             if (shW[s] > L || shH[s] > oRun[o]) continue;
-            OPS(14, 1);
+            OPS(K_TRIAL, 1);
             c = trial(s, k, M, ca, cb);
             if (c < 0) {
                 if (trialPlaced > partR) { partR = trialPlaced; partS = s; }
@@ -644,7 +619,7 @@ static int place_user(int u, int ca, int cb) {
             assign_done(u);
             return 1;
         }
-        if (MIXED && partS >= 0 && !firstShape &&
+        if (partS >= 0 && !firstShape &&
             trial_mixed(partS, partR, k, M, oRun[o], ca, cb)) {
             for (r = 0; r < k; r++) add_rb(u, bsY[r], bsX[r], bsS[r]);
             p->uOpt = o; p->uShape = -1;    /* mixed shapes */
@@ -656,7 +631,7 @@ static int place_user(int u, int ca, int cb) {
 }
 
 /* ------------------------------------------------------------------ */
-/* x^a for x > 0 without the math library                              */
+/* log and exp without the math library                               */
 /* ------------------------------------------------------------------ */
 static double my_log(double x) {
     double r = 0, t, t2, sum;
@@ -678,10 +653,6 @@ static double my_exp(double x) {
     while (n--) r *= r;
     return r;
 }
-
-#ifndef KEY_ALPHA
-#define KEY_ALPHA 1.0
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Setup                                                              */
@@ -760,7 +731,7 @@ static void build_options(int u, const int *bits, int *vals) {
     if (p->no) {
         p->lp = my_log((double)p->prof);
         p->la = my_log((double)kmin * S);
-        p->key = my_exp(p->lp - KEY_ALPHA * p->la);
+        p->key = my_exp(p->lp - p->la);      /* profit per BU */
     }
 }
 
@@ -850,9 +821,9 @@ static void read_input(void) {
         p->first = -1;
         if (nsh) build_options(i, bits, vals);
         if (p->prof <= 0) p->no = 0;
-        OPS(6, ibytes - lastBytes);
+        OPS(K_BYTE, ibytes - lastBytes);
         lastBytes = ibytes;
-        OPS(12, Y + 10);
+        OPS(K_SETUP, Y + 10);
     }
     free(bits); free(vals);
 }
@@ -862,9 +833,7 @@ static void read_input(void) {
 /* ------------------------------------------------------------------ */
 static int *order;
 
-#ifndef CONS_FRAC
 #define CONS_FRAC 0.6               /* share of the budget for the construction */
-#endif
 #define NMODE 4
 /* relative cost of the placement modes (measured) */
 static const double modeCost[NMODE] = { 1.0, 0.45, 0.2, 0.08 };
@@ -883,21 +852,12 @@ static void set_mode(int m) {
  * checkpoints the cost per user of the recent segment is projected over
  * the remaining users and the cheapest sufficient mode is chosen.
  */
-#ifndef LA_CORE
-#define LA_CORE 8                   /* lookahead for the users that fill the grid */
-#endif
-#ifndef CORE_FRAC
-#define CORE_FRAC 1.0
-#endif
 static void build_pass(int n, ll budget) {
     ll start = ops, segOps = ops;
     int i, seg = n / 256 + 1, segI = 0;
-    double area = 0, core = CORE_FRAC * Y * (double)Xc;
     set_mode(0);
     for (i = 0; i < n; i++) {
         int u = order[i];
-        if (curMode == 0) lookMul = area < core ? LA_CORE : LA_MUL;
-        area += (double)oK[U[u].o0] * S;
         if (i - segI >= seg) {
             double per = (double)(ops - segOps) / (i - segI) / modeCost[curMode];
             double left = (double)(budget - (ops - start));
@@ -909,15 +869,10 @@ static void build_pass(int n, ll budget) {
         if (ops - start > budget + budget / 10) break;   /* hard stop */
         place_user(u, U[u].arr, U[u].dl);
     }
-#ifdef DEBUG
-    fprintf(stderr, "mode %d at %d/%d ", curMode, i, n);
-#endif
     set_mode(0);
 }
 
-#ifndef MULTI_FRAC
 #define MULTI_FRAC 0.3              /* extra constructions while under this share */
-#endif
 static const double consAlpha[] = { 1.0, 0.85, 1.15, 0.7, 1.3, 0.55 };
 static double curAlpha = 1.0;       /* order: profit / area^curAlpha */
 static int cmp_cand(const void *a, const void *b);
@@ -934,15 +889,9 @@ static int cmp_prio(const void *a, const void *b) {
     return i - j;
 }
 
-#ifndef SWO_FRAC
 #define SWO_FRAC 0.4                /* squeaky-wheel rounds while under this share */
-#endif
-#ifndef SWO_STALL
 #define SWO_STALL 15                /* rounds without a better solution */
-#endif
-#ifndef SWO_LOG
 #define SWO_LOG 0.18                /* log of the priority boost per round */
-#endif
 
 /*
  * Greedy constructions.  First with different exponents of the profit /
@@ -952,7 +901,7 @@ static int cmp_prio(const void *a, const void *b) {
  */
 static void construct(void) {
     int i, n = 0, v, bestV = 0, vBest = 0;
-    ll budget = (ll)(WORK_LIMIT * CONS_FRAC), start = ops, first = 0, last;
+    ll avail = WORK_LIMIT - ops, budget = (ll)(avail * CONS_FRAC), start = ops, first = 0, last;
     order = malloc(sizeof(int) * (N + 1));
     prio = malloc(sizeof(double) * (N + 1));
     if (!order || !prio) exit(1);
@@ -961,7 +910,7 @@ static void construct(void) {
     for (v = 0; v < (int)(sizeof consAlpha / sizeof consAlpha[0]); v++) {
         ll t0 = ops;
         if (v > 0) {
-            if (ops - start + first + first / 4 > (ll)(WORK_LIMIT * MULTI_FRAC)) break;
+            if (ops - start + first + first / 4 > (ll)(avail * MULTI_FRAC)) break;
             for (i = 0; i < N; i++) if (U[i].first >= 0) remove_user(i);
         }
         curAlpha = consAlpha[v];
@@ -969,15 +918,12 @@ static void construct(void) {
         OPS(K_RUIN, 20LL * n);
         build_pass(n, budget - (ops - start));
         if (v == 0) first = ops - t0;
-#ifdef DEBUG
-        fprintf(stderr, "c%d=%lld ", v, totalProfit);
-#endif
         if (totalProfit > snapP) { save_best(); bestV = v; }
     }
     /* squeaky wheel from the best exponent */
     for (i = 0; i < N; i++) prio[i] = U[i].lp - consAlpha[bestV] * U[i].la;
     last = first;
-    for (v = 0; ops - start + last + last / 4 <= (ll)(WORK_LIMIT * SWO_FRAC) && v - vBest <= SWO_STALL; v++) {
+    for (v = 0; ops - start + last + last / 4 <= (ll)(avail * SWO_FRAC) && v - vBest <= SWO_STALL; v++) {
         ll t0 = ops;
         int left = 0;
         if (v == 0) restore_best();         /* continue from the best solution */
@@ -988,20 +934,14 @@ static void construct(void) {
         OPS(K_RUIN, 20LL * n);
         build_pass(n, budget - (ops - start));
         last = ops - t0;
-#ifdef DEBUG
-        if (totalProfit > snapP) fprintf(stderr, "s%d=%lld ", v, totalProfit);
-#endif
         if (totalProfit > snapP) { save_best(); vBest = v; }
     }
-#ifdef DEBUG
-    fprintf(stderr, "swo %d ", v);
-#endif
     if (snapP > totalProfit) restore_best();
     curAlpha = 1.0;
 }
 
 /* ------------------------------------------------------------------ */
-/* Local search: ruin and recreate over time strips                   */
+/* Local search: ruin and recreate over rectangles                     */
 /* ------------------------------------------------------------------ */
 #define NCLS 256
 static int *clsUsers[NCLS], clsN[NCLS];   /* users by window-length class, sorted by arrival */
@@ -1064,7 +1004,6 @@ static void save_rb(int y, int x, int s) {
     svY[nSv] = y; svX[nSv] = x; svS[nSv] = s; nSv++;
 }
 
-/* unserved users whose window meets columns [x0, x1] */
 /*
  * Unserved users by window class: a max-tree over each class (sorted by
  * arrival) holds the key of every unserved user, so the best unserved
@@ -1085,7 +1024,7 @@ static void tree_set(int u) {
     trV[c][i] = v;
     for (i >>= 1; i; i >>= 1) {
         double m = trV[c][2 * i] > trV[c][2 * i + 1] ? trV[c][2 * i] : trV[c][2 * i + 1];
-        OPS(7, 1);
+        OPS(K_TREE, 1);
         if (trV[c][i] == m) break;
         trV[c][i] = m;
     }
@@ -1129,7 +1068,7 @@ static void heap_push(double v, int c, int n) {
         i = p;
     }
     hV[i] = v; hC[i] = c; hN[i] = n;
-    OPS(7, 4);
+    OPS(K_TREE, 4);
 }
 
 static void heap_pop(void) {
@@ -1146,7 +1085,7 @@ static void heap_pop(void) {
         i = b;
     }
     hV[i] = v; hC[i] = c; hN[i] = n;
-    OPS(7, 4);
+    OPS(K_TREE, 4);
 }
 
 /* adds up to `want` of the best unserved users whose window meets [x0, x1] */
@@ -1165,7 +1104,7 @@ static void collect_unserved(int x0, int x1, int want) {
             int mid = (l + hi) / 2;
             if (U[a[mid]].arr <= x1) l = mid + 1; else hi = mid;
         }
-        OPS(7, 40);
+        OPS(K_TREE, 40);
         for (l = lo + trP[c], r = hi + trP[c]; l < r; l >>= 1, r >>= 1) {
             if (l & 1) { if (trV[c][l] > 0) heap_push(trV[c][l], c, l); l++; }
             if (r & 1) { --r; if (trV[c][r] > 0) heap_push(trV[c][r], c, r); }
@@ -1196,7 +1135,9 @@ static int cmp_cand(const void *a, const void *b) {
     return i - j;
 }
 
-static ll stIt, stAcc, stRem, stCand, stImp;
+static int needSave;                /* the step must be repeated after saving */
+#define SPAN_MUL 4                  /* users spanning at most this many strip
+                                       widths are re-placed whole */
 
 /*
  * One ruin-and-recreate step on the rectangle columns [x0, x1] x rows
@@ -1204,13 +1145,10 @@ static ll stIt, stAcc, stRem, stCand, stImp;
  * is placed again from scratch; a user that lost only some of them must put
  * that many RBs back (same shape and rows) near the rectangle, or it is
  * dropped.  The best unserved users overlapping the strip are tried too.
- * The change is kept if the profit does not drop.  Returns the number of
- * users touched.
+ * The change is kept if the profit does not drop (or drops by at most thr).
+ * Returns the number of users touched, or -1 - that number when the step
+ * has to be repeated (the best solution was saved first).
  */
-static int needSave;
-#ifndef SPAN_MUL
-#define SPAN_MUL 4
-#endif
 static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
     int c, i, rx0, rx1, wmax = 0, spanLim;
     ll oldP = totalProfit, oldA = usedArea;
@@ -1225,7 +1163,7 @@ static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
         if (c < 0) continue;
         for (id = cHead[c]; id >= 0; id = cNext[id]) {
             int u = nU[id];
-            OPS(8, 1);
+            OPS(K_RUIN, 1);
             if (nX[id] + shW[nS[id]] - 1 < x0) continue;
             if (nY[id] > y1 || nY[id] + shH[nS[id]] - 1 < y0) continue;
             if (U[u].stamp != stampNow) {
@@ -1235,7 +1173,7 @@ static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
             }
             need[u]++;
         }
-        OPS(8, 2);
+        OPS(K_RUIN, 2);
     }
     /* save every touched user, then take out its RBs inside the rectangle */
     for (i = 0; i < nRem; i++) {
@@ -1265,8 +1203,7 @@ static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
     /* touched users always; the best unserved ones up to maxCand in all */
     collect_unserved(x0, x1, maxCand - nRem > 4 ? maxCand - nRem : 4);
     qsort(candList, nCand, sizeof(int), cmp_cand);
-    OPS(8, 8LL * nCand);
-    stIt++; stRem += nRem; stCand += nCand;
+    OPS(K_RUIN, 8LL * nCand);
     nIns = 0;
     for (i = 0; i < nCand; i++) {
         int u = candList[i];
@@ -1287,12 +1224,9 @@ static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
         if (place_user(u, ca, cb)) insList[nIns++] = u;
     }
     if (totalProfit > oldP || (totalProfit == oldP && usedArea <= oldA)) {
-        stAcc++;
-        if (totalProfit > oldP) stImp++;
         return nRem;
     }
     if (thr > 0 && totalProfit >= oldP - thr && oldP <= snapP) {
-        stAcc++;
         return nRem;                        /* worse, accepted */
     }
     needSave = thr > 0 && totalProfit >= oldP - thr;    /* accept after saving */
@@ -1313,12 +1247,8 @@ static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
 }
 
 #define NLEV 4
-#ifndef BAND0
 #define BAND0 16
-#endif
-#ifndef TARGET
 #define TARGET 10
-#endif
 /* best solution snapshot */
 static int *bAsg, *bOpt, *bShape, *bOff, *bY, *bX, *bS, bCap;
 
@@ -1346,7 +1276,7 @@ static void save_best(void) {
     }
     bOff[N] = n;
     snapP = totalProfit;
-    OPS(8, 4LL * (N + n));
+    OPS(K_RUIN, 4LL * (N + n));
 }
 
 static void restore_best(void) {
@@ -1360,12 +1290,8 @@ static void restore_best(void) {
     }
 }
 
-#ifndef THR_MUL
 #define THR_MUL 0.5
-#endif
-#ifndef THR_SWEEPS
 #define THR_SWEEPS 10
-#endif
 static const double alphas[5] = { 1.0, 0.85, 1.15, 0.7, 1.3 };
 
 static void local_search(void) {
@@ -1391,16 +1317,15 @@ static void local_search(void) {
         nLev++;
     }
     for (pass = 0; ops < WORK_LIMIT; pass++) {
-        int lv = pass % nLev, h = hb[lv], left = 0;
+        int lv = pass % nLev, h = hb[lv], left = 0, yoff, y0, x0;
         for (u = 0; u < N; u++) if (U[u].no && !U[u].asg) left++;
-        OPS(8, N);
+        OPS(K_RUIN, N);
         if (!left) break;                   /* everybody is served */
         if (pass == nLev) {     /* threshold accepting only with many sweeps ahead */
             double sweeps = (double)span / (ops - start + 1) * nLev;
             thr0 = sweeps >= THR_SWEEPS ? thr0 : 0;
         }
-        int yoff = ((pass / nLev) & 1) ? h / 2 : 0;
-        int y0, x0;
+        yoff = ((pass / nLev) & 1) ? h / 2 : 0;
         curAlpha = alphas[(pass / nLev) % 5];
         for (y0 = (yoff ? -yoff : 0); y0 < Y && ops < WORK_LIMIT; y0 += h) {
             int ya = y0 < 0 ? 0 : y0, yb = y0 + h - 1 < Y ? y0 + h - 1 : Y - 1;
@@ -1445,13 +1370,12 @@ int main(void) {
     set_weights(wCons);
     read_input();
     compress_time();
-    CALIB_MARK("read");
     occ = calloc((size_t)(Xc > 0 ? Xc : 1) * W, sizeof(u64));
     cHead = malloc(sizeof(int) * (Xc + 1));
     tA = malloc(sizeof(u64) * W); tP = malloc(sizeof(u64) * W);
     tT = malloc(sizeof(u64) * W); tQ = malloc(sizeof(u64) * W);
     tO = malloc(sizeof(u64) * W); tN = malloc(sizeof(u64) * W);
-    if (!occ || !cHead || !tA || !tP || !tT || !tQ) exit(1);
+    if (!occ || !cHead || !tA || !tP || !tT || !tQ || !tO || !tN) exit(1);
     for (c = 0; c <= Xc; c++) cHead[c] = -1;
     spot_init();
     fen_init();
@@ -1461,21 +1385,8 @@ int main(void) {
     }
     set_weights(wCons);
     construct();
-    CALIB_MARK("cons");
-#ifdef DEBUG
-    fprintf(stderr, "construct %lld util %.3f ops %lld\n", totalProfit, (double)usedArea / ((double)Y * Xc), ops);
-#endif
     set_weights(wLs);
     local_search();
-#ifdef DEBUG
-    fprintf(stderr, "it %lld acc %lld imp %lld rem %.1f cand %.1f ", stIt, stAcc, stImp, (double)stRem / (stIt + 1), (double)stCand / (stIt + 1));
-    fprintf(stderr, "final %lld util %.3f ops %lld\n", totalProfit, (double)usedArea / ((double)Y * Xc), ops);
-#endif
-    CALIB_MARK("ls");
     write_output();
-    CALIB_MARK("out");
-#ifdef CALIB
-    { int k; fprintf(stderr, "CNT"); for (k = 0; k < 15; k++) fprintf(stderr, " %lld", cnt[k]); fprintf(stderr, "\n"); }
-#endif
     return 0;
 }
