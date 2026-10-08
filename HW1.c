@@ -44,16 +44,20 @@ typedef long long ll;
 #define OPT_DEN 2
 #define OPT_ADD 1
 /*
- * Total work budget in 0.1 ns units (about 4.5 s with optimisation).  A
- * build without optimisation runs up to 4 times slower per unit, so it gets
- * less.
+ * Work budgets in 0.1 ns units of the calibration machine.  The computation
+ * after reading gets COMP_WORK; reading plus computation stay within
+ * TOTAL_WORK (the input is read by scanf, which is equally fast in every
+ * build).  A build without optimisation computes up to SLOW times slower.
  */
 #ifdef __OPTIMIZE__
-#define WORK_LIMIT 45000000000LL
+#define COMP_WORK 30000000000LL
+#define SLOW 1
 #else
-#define WORK_LIMIT 20000000000LL
+#define COMP_WORK 13000000000LL
+#define SLOW 4
 #endif
-#define WORK_HARD (WORK_LIMIT + WORK_LIMIT / 20)   /* no placement goes past this */
+#define TOTAL_WORK 60000000000LL
+#define MIN_COMP (COMP_WORK / 4)
 #define MAXEVAL 1000000         /* most spots scored per RB               */
 #define LA_MIN 32               /* ...but at least this many columns       */
 #define LA_MUL 8                /* lookahead after the first fit, in RB widths */
@@ -61,30 +65,11 @@ typedef long long ll;
 /* ------------------------------------------------------------------ */
 /* Input                                                              */
 /* ------------------------------------------------------------------ */
-static char ibuf[1 << 16];
-static int ipos, ilen;
-static long long ibytes;            /* input bytes read so far */
-
-static int read_char(void) {
-    if (ipos == ilen) {
-        ilen = (int)fread(ibuf, 1, sizeof ibuf, stdin);
-        ipos = 0;
-        if (ilen > 0) ibytes += ilen;
-        if (ilen <= 0) return -1;
-    }
-    return ibuf[ipos++];
-}
-
+/* reads one integer with scanf (0 at the end of the input) */
 static ll read_int(void) {
-    int c = read_char(), neg = 0;
-    ll v = 0;
-    while (c != '-' && (c < '0' || c > '9')) {
-        if (c < 0) return 0;
-        c = read_char();
-    }
-    if (c == '-') { neg = 1; c = read_char(); }
-    while (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); c = read_char(); }
-    return neg ? -v : v;
+    ll v;
+    if (scanf("%lld", &v) != 1) return 0;
+    return v;
 }
 
 /* ------------------------------------------------------------------ */
@@ -122,13 +107,14 @@ static unsigned char *wallL;        /* wallL[c]: column c - 1 is not usable */
  * cost more when the working set is large (factor g, see set_weights()).
  */
 static ll ops;
+static ll workLimit, workHard;      /* end of the computation, hard end */
 static ll opW[15];
-enum { K_MARK, K_CAND, K_CONTACT, K_SPOT, K_SCAN, K_PLACE, K_BYTE, K_TREE,
+enum { K_MARK, K_CAND, K_CONTACT, K_SPOT, K_SCAN, K_PLACE, K_NUM, K_TREE,
        K_RUIN, K_NODE, K_CANDW, K_SPOTW, K_SETUP, K_FEN, K_TRIAL };
 /* ns per step: base and per unit of g, for construction and local search */
 static const double wCons[15][2] = {
     {0.83, 1.26}, {0.3, 0}, {1.41, 0}, {0.34, 0}, {0.49, 0}, {1.0, 116},
-    {1.0, 0}, {4.8, 0}, {2.1, 0}, {515, 0}, {0.61, 0}, {0.35, 0},
+    {80, 0}, {4.8, 0}, {2.1, 0}, {515, 0}, {0.61, 0}, {0.35, 0},
     {20, 1.4}, {0.5, 0}, {137, 0}
 };
 static const double wLs[15][2] = {
@@ -529,7 +515,7 @@ static void ensure_pos(int k) {
 static ll trial(int s, int k, const u64 *M, int ca, int cb) {
     int h = shH[s], w = shW[s], last = cb - w + 1, x = ca, r, j;
     ll sum = 0;
-    for (r = 0; r < k && ops < WORK_HARD; r++) {
+    for (r = 0; r < k && ops < workHard; r++) {
         int xf, xe, xx, bestC = -1, by = 0, bx = 0, ne = 0;
         x = next_spot(s, x, last);
         while (x <= last && !candidates(x, h, w, M)) x = next_spot(s, x + 1, last);
@@ -803,7 +789,6 @@ static void compress_time(void) {
 
 static void read_input(void) {
     int i, y, s, *bits, *vals;
-    ll lastBytes = 0;
     Y = (int)read_int(); X = (int)read_int(); S = (int)read_int(); N = (int)read_int();
     W = (Y + 63) / 64;
     nsh = 0; minW = 1 << 30;
@@ -833,8 +818,7 @@ static void read_input(void) {
         p->first = -1;
         if (nsh) build_options(i, bits, vals);
         if (p->prof <= 0) p->no = 0;
-        OPS(K_BYTE, ibytes - lastBytes);
-        lastBytes = ibytes;
+        OPS(K_NUM, Y + 15);         /* scanf: per number, plus per user */
         OPS(K_SETUP, Y + 10);
     }
     free(bits); free(vals);
@@ -913,7 +897,7 @@ static int cmp_prio(const void *a, const void *b) {
  */
 static void construct(void) {
     int i, n = 0, v, bestV = 0, vBest = 0;
-    ll avail = WORK_LIMIT - ops, budget = (ll)(avail * CONS_FRAC), start = ops, first = 0, last;
+    ll avail = workLimit - ops, budget = (ll)(avail * CONS_FRAC), start = ops, first = 0, last;
     order = malloc(sizeof(int) * (N + 1));
     prio = malloc(sizeof(double) * (N + 1));
     if (!order || !prio) exit(1);
@@ -1309,7 +1293,7 @@ static const double alphas[5] = { 1.0, 0.85, 1.15, 0.7, 1.3 };
 static void local_search(void) {
     int target = TARGET, pass, nLev = 0, l, tw[NLEV], hb[NLEV], u, nAsg = 0;
     /* the output (about 40 ns per RB) is written after the search */
-    ll lsEnd = WORK_LIMIT - 400 * (usedArea / (S > 0 ? S : 1)) - 200LL * N;
+    ll lsEnd = workLimit - 400 * (usedArea / (S > 0 ? S : 1)) - 200LL * N;
     ll start = ops, span = lsEnd - ops, thr0;
     if (Xc <= 0 || span <= 0) return;
     build_classes();
@@ -1397,6 +1381,13 @@ int main(void) {
     {   /* working set in bytes -> memory factor of the weights */
         double mem = (double)Xc * (W * 8 + 16) + (double)N * 112 + (double)nOpt * (8 * W + 8);
         memG = mem > 8e6 ? my_log(mem / 8e6) / 0.69314718055994531 : 0;
+    }
+    {   /* computation budget after reading */
+        ll comp = (TOTAL_WORK - ops) / SLOW;
+        if (comp > COMP_WORK) comp = COMP_WORK;
+        if (comp < MIN_COMP) comp = MIN_COMP;
+        workLimit = ops + comp;
+        workHard = workLimit + comp / 20;   /* no placement goes past this */
     }
     set_weights(wCons);
     construct();
