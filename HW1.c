@@ -31,15 +31,25 @@ typedef unsigned long long u64;
 typedef long long ll;
 
 #define MAXSH   64              /* most shapes (divisors of S)            */
+#ifndef MAXOPT
 #define MAXOPT  6               /* most options kept per user             */
+#endif
+#ifndef OPT_NUM                 /* options need at most NUM/DEN * kmin + ADD RBs */
+#define OPT_NUM 3
+#define OPT_DEN 2
+#define OPT_ADD 1
+#endif
 #ifndef WORK_LIMIT
-#define WORK_LIMIT 95000000000LL   /* total work budget (ops, ~0.1 ns each)  */
+#define WORK_LIMIT 80000000000LL   /* total work budget (0.1 ns units)        */
 #endif
 #ifndef MAXEVAL
 #define MAXEVAL 1000000         /* most spots scored per RB               */
 #endif
+#ifndef LA_MIN
+#define LA_MIN 32               /* ...but at least this many columns       */
+#endif
 #ifndef LA_MUL
-#define LA_MUL 4                /* lookahead after the first fit, in RB widths */
+#define LA_MUL 8                /* lookahead after the first fit, in RB widths */
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -47,11 +57,13 @@ typedef long long ll;
 /* ------------------------------------------------------------------ */
 static char ibuf[1 << 16];
 static int ipos, ilen;
+static long long ibytes;            /* input bytes read so far */
 
 static int read_char(void) {
     if (ipos == ilen) {
         ilen = (int)fread(ibuf, 1, sizeof ibuf, stdin);
         ipos = 0;
+        if (ilen > 0) ibytes += ilen;
         if (ilen <= 0) return -1;
     }
     return ibuf[ipos++];
@@ -98,26 +110,50 @@ static u64 *occ;                    /* occupancy, column-major: Xc * W words */
 static unsigned char *wallL;        /* wallL[c]: column c - 1 is not usable */
 
 /*
- * Work counter.  Every kind of step k is charged opW[k] units (about 0.1 ns
- * each on the test machine; weights fitted to measured run times).
+ * Work counter.  A step of kind k is charged opW[k] units (0.1 ns each).
+ * The weights are fitted to measured run times, separately for the input,
+ * construction and local search phases; steps with random memory access
+ * cost more when the working set is large (factor g, see set_weights()).
  */
 static ll ops;
-static const ll opW[12] = {
-    62,     /* 0 marking cells, free-cell tree */
-    8,      /* 1 candidate rows of a column    */
-    12,     /* 2 contact counting              */
-    3,      /* 3 free-spot test                */
-    5,      /* 4 free-spot scan / update       */
-    30,     /* 5 placement attempt overhead    */
-    434,    /* 6 input (per number)            */
-    24,     /* 7 unserved-user trees           */
-    3,      /* 8 ruin bookkeeping              */
-    471,    /* 9 RB node insert / delete       */
-    11,     /* 10 candidate rows, several words */
-    5       /* 11 free-spot test, several words */
+static ll opW[15];
+enum { K_MARK, K_CAND, K_CONTACT, K_SPOT, K_SCAN, K_PLACE, K_BYTE, K_TREE,
+       K_RUIN, K_NODE, K_CANDW, K_SPOTW, K_SETUP, K_FEN, K_TRIAL };
+/* ns per step: base and per unit of g, for construction and local search */
+static const double wCons[15][2] = {
+    {0.83, 1.26}, {0.3, 0}, {1.41, 0}, {0.34, 0}, {0.49, 0}, {1.0, 116},
+    {1.0, 0}, {4.8, 0}, {2.1, 0}, {515, 0}, {0.61, 0}, {0.35, 0},
+    {20, 1.4}, {0.5, 0}, {137, 0}
 };
+static const double wLs[15][2] = {
+    {9.2, 0.48}, {0.3, 0}, {1.19, 0}, {0.39, 0}, {0.1, 0}, {1.0, 18.4},
+    {1.0, 0}, {4.8, 0}, {2.1, 0}, {10, 0}, {0.82, 0}, {0.17, 0},
+    {20, 1.4}, {0.5, 0.16}, {44.6, 0}
+};
+static double memG;                 /* log2(working set / 8 MB), >= 0 */
+
+static void set_weights(const double w[15][2]) {
+    int k;
+    for (k = 0; k < 15; k++) {
+        opW[k] = (ll)(10.0 * (w[k][0] + w[k][1] * memG) + 0.5);
+        if (opW[k] < 1) opW[k] = 1;
+    }
+}
 #ifdef CALIB
-static ll cnt[12];
+#include <time.h>
+static ll cnt[16];
+static void calib_mark(const char *ph) {
+    int k;
+    fprintf(stderr, "PH %s %.4f", ph, (double)clock() / CLOCKS_PER_SEC);
+    fprintf(stderr, " %d %d %d %d", N, Xc, W, nOpt);
+    for (k = 0; k < 15; k++) fprintf(stderr, " %lld", cnt[k]);
+    fprintf(stderr, "\n");
+}
+#define CALIB_MARK(ph) calib_mark(ph)
+#else
+#define CALIB_MARK(ph)
+#endif
+#ifdef CALIB
 #define OPS(k, v) do { ll v_ = (v); ops += v_ * opW[k]; cnt[k] += v_; } while (0)
 #else
 #define OPS(k, v) (ops += (v) * opW[k])
@@ -184,6 +220,7 @@ static void runs_words(const u64 *A, int h, u64 *P) {
         shr_words(P, st, tT);
         for (j = 0; j < W; j++) P[j] &= tT[j];
         len += st;
+        OPS(10, 2 * (W + 2));
     }
 }
 
@@ -216,12 +253,12 @@ static void set_rect(int y, int x, int s, int on) {
 static ll *fen;
 
 static void fen_add(int x, ll v) {
-    for (x++; x <= Xc; x += x & -x) fen[x] += v;
+    for (x++; x <= Xc; x += x & -x) { fen[x] += v; OPS(13, 1); }
 }
 
 static ll fen_sum(int x) {          /* free cells in columns [0, x) */
     ll r = 0;
-    for (; x > 0; x -= x & -x) r += fen[x];
+    for (; x > 0; x -= x & -x) { r += fen[x]; OPS(13, 1); }
     return r;
 }
 
@@ -238,7 +275,7 @@ static void fen_init(void) {
 static void fen_rect(int x, int s, int sign) {
     int c;
     for (c = 0; c < shW[s]; c++) fen_add(x + c, (ll)sign * shH[s]);
-    OPS(0, shW[s] * 4);
+    OPS(0, shW[s]);
 }
 
 /* number of occupied cells in rows [y, y + h) of column c */
@@ -294,7 +331,7 @@ static int candidates(int x, int h, int w, const u64 *M) {
         }
         if (!any) break;
     }
-    OPS(10, (c + 1) * W);
+    OPS(10, (c + 1) * (W + 2));
     if (!any) return 0;
     runs_words(tA, h, tP);
     any = 0;
@@ -306,7 +343,7 @@ static int candidates(int x, int h, int w, const u64 *M) {
         u64 up = (tA[j] << 1) | (j ? tA[j - 1] >> 63 : 0);
         tP[j] &= ~up | ~tQ[j];
     }
-    OPS(10, 4 * W);
+    OPS(10, 4 * (W + 2));
     return 1;
 }
 
@@ -354,9 +391,9 @@ static int spot_at(int s, int x) {
         const u64 *q = occ + (size_t)(x + c) * W;
         u64 any = 0;
         for (j = 0; j < W; j++) { tA[j] &= ~q[j]; any |= tA[j]; }
-        if (!any) { OPS(11, (c + 1) * W); return 0; }
+        if (!any) { OPS(11, (c + 1) * (W + 2)); return 0; }
     }
-    OPS(11, (w + 4) * W);
+    OPS(11, (w + 4) * (W + 2));
     runs_words(tA, h, tQ);
     for (j = 0; j < W; j++) if (tQ[j]) return 1;
     return 0;
@@ -507,7 +544,7 @@ static ll trial(int s, int k, const u64 *M, int ca, int cb) {
         while (x <= last && !candidates(x, h, w, M)) x = next_spot(s, x + 1, last);
         if (x > last) break;
         xf = x;
-        xe = xf + lookMul * w;
+        xe = xf + (lookMul ? (lookMul * w > LA_MIN ? lookMul * w : LA_MIN) : 0);
         if (xe > last) xe = last;
         for (xx = xf; xx <= xe && ne < maxEval; xx++) {
             if (xx > xf) {
@@ -540,7 +577,7 @@ static int place_user(int u, int ca, int cb) {
     ll freeCells;
     if (L < minW) return 0;
     freeCells = fen_sum(cb + 1) - fen_sum(ca);
-    OPS(5, 20);
+    OPS(5, 1);
     for (o = p->o0; o < p->o0 + p->no && o < p->o0 + maxOpt; o++) {
         int k = oK[o], bestS = -1, r;
         ll bestNum = 0, bestDen = 1;
@@ -550,7 +587,7 @@ static int place_user(int u, int ca, int cb) {
         for (s = 0; s < nsh && !(firstShape && bestS >= 0); s++) {
             ll c, den;
             if (shW[s] > L || shH[s] > oRun[o]) continue;
-            OPS(5, 10);
+            OPS(14, 1);
             c = trial(s, k, M, ca, cb);
             if (c < 0) continue;
             den = (ll)k * 2 * (shH[s] + shW[s]);
@@ -650,7 +687,7 @@ static void build_options(int u, const int *bits, int *vals) {
                 kNext = (dem + sv - 1) / sv;
                 if (kNext == k) continue;           /* lower threshold: same k, more rows */
             }
-            if (kmin > 0 && k > kmin + kmin / 2 + 1) break;
+            if (kmin > 0 && k * OPT_DEN > (ll)kmin * OPT_NUM + OPT_ADD * OPT_DEN) break;
             if (p->no >= MAXOPT) break;
             if (k * S > (ll)rows * L) continue;      /* cannot fit at all */
             for (y = 0; y < Y; y++) {
@@ -735,6 +772,7 @@ static void compress_time(void) {
 
 static void read_input(void) {
     int i, y, s, *bits, *vals;
+    ll lastBytes = 0;
     Y = (int)read_int(); X = (int)read_int(); S = (int)read_int(); N = (int)read_int();
     W = (Y + 63) / 64;
     nsh = 0; minW = 1 << 30;
@@ -764,7 +802,9 @@ static void read_input(void) {
         p->first = -1;
         if (nsh) build_options(i, bits, vals);
         if (p->prof <= 0) p->no = 0;
-        OPS(6, Y + 10);
+        OPS(6, ibytes - lastBytes);
+        lastBytes = ibytes;
+        OPS(12, Y + 10);
     }
     free(bits); free(vals);
 }
@@ -773,12 +813,6 @@ static void read_input(void) {
 /* Greedy construction                                                */
 /* ------------------------------------------------------------------ */
 static int *order;
-
-static int cmp_key(const void *a, const void *b) {
-    const User *p = &U[*(const int *)a], *q = &U[*(const int *)b];
-    if (p->key != q->key) return p->key > q->key ? -1 : 1;
-    return *(const int *)a - *(const int *)b;
-}
 
 #ifndef CONS_FRAC
 #define CONS_FRAC 0.6               /* share of the budget for the construction */
@@ -824,13 +858,46 @@ static void build_pass(int n, ll budget) {
     set_mode(0);
 }
 
+#ifndef MULTI_FRAC
+#define MULTI_FRAC 0.3              /* extra constructions while under this share */
+#endif
+static const double consAlpha[] = { 1.0, 0.85, 1.15, 0.7, 1.3, 0.55 };
+static double curAlpha = 1.0;       /* order: profit / area^curAlpha */
+static int cmp_cand(const void *a, const void *b);
+static void snap_alloc(void);
+static void save_best(void);
+static void restore_best(void);
+static ll snapP = -1;               /* profit of the saved best solution */
+
+/*
+ * Greedy constructions with different orders while they are cheap; the
+ * best one is kept.
+ */
 static void construct(void) {
-    int i, n = 0;
+    int i, n = 0, v;
+    ll budget = (ll)(WORK_LIMIT * CONS_FRAC), start = ops, first = 0;
     order = malloc(sizeof(int) * (N + 1));
     if (!order) exit(1);
+    snap_alloc();
     for (i = 0; i < N; i++) if (U[i].no) order[n++] = i;
-    qsort(order, n, sizeof(int), cmp_key);
-    build_pass(n, (ll)(WORK_LIMIT * CONS_FRAC));
+    for (v = 0; v < (int)(sizeof consAlpha / sizeof consAlpha[0]); v++) {
+        ll t0 = ops;
+        if (v > 0) {
+            if (ops - start + first + first / 4 > (ll)(WORK_LIMIT * MULTI_FRAC)) break;
+            for (i = 0; i < N; i++) if (U[i].first >= 0) remove_user(i);
+        }
+        curAlpha = consAlpha[v];
+        qsort(order, n, sizeof(int), cmp_cand);
+        OPS(8, 20LL * n);
+        build_pass(n, budget - (ops - start));
+        if (v == 0) first = ops - t0;
+#ifdef DEBUG
+        fprintf(stderr, "c%d=%lld ", v, totalProfit);
+#endif
+        if (totalProfit > snapP) save_best();
+    }
+    if (snapP > totalProfit) restore_best();
+    curAlpha = 1.0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1022,8 +1089,6 @@ static void collect_unserved(int x0, int x1, int want) {
     }
 }
 
-static double curAlpha = 1.0;       /* refill order: profit / area^curAlpha */
-
 static int cmp_cand(const void *a, const void *b) {
     int i = *(const int *)a, j = *(const int *)b;
     double ki = U[i].lp - curAlpha * U[i].la, kj = U[j].lp - curAlpha * U[j].la;
@@ -1046,9 +1111,6 @@ static int needSave;
 #ifndef SPAN_MUL
 #define SPAN_MUL 4
 #endif
-static ll snapP = -1;                /* profit of the saved best solution */
-static void save_best(void);
-
 static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
     int c, i, rx0, rx1, wmax = 0, spanLim;
     ll oldP = totalProfit, oldA = usedArea;
@@ -1160,6 +1222,12 @@ static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
 /* best solution snapshot */
 static int *bAsg, *bOpt, *bShape, *bOff, *bY, *bX, *bS, bCap;
 
+static void snap_alloc(void) {
+    bAsg = malloc(sizeof(int) * (N + 1)); bOpt = malloc(sizeof(int) * (N + 1));
+    bShape = malloc(sizeof(int) * (N + 1)); bOff = malloc(sizeof(int) * (N + 1));
+    if (!bAsg || !bOpt || !bShape || !bOff) exit(1);
+}
+
 static void save_best(void) {
     int u, n = 0, id;
     for (u = 0; u < N; u++) {
@@ -1212,10 +1280,7 @@ static void local_search(void) {
     svOpt = malloc(sizeof(int) * (N + 1));
     svShape = malloc(sizeof(int) * (N + 1));
     need = malloc(sizeof(int) * (N + 1));
-    bAsg = malloc(sizeof(int) * (N + 1)); bOpt = malloc(sizeof(int) * (N + 1));
-    bShape = malloc(sizeof(int) * (N + 1)); bOff = malloc(sizeof(int) * (N + 1));
     if (!remList || !insList || !svOff || !svOpt || !svShape || !need) exit(1);
-    if (!bAsg || !bOpt || !bShape || !bOff) exit(1);
     for (u = 0; u < N; u++) nAsg += U[u].asg;
     thr0 = (ll)(THR_MUL * (double)totalProfit / (nAsg ? nAsg : 1));
     for (l = 0; l < NLEV; l++) {        /* row bands of 16, 32, ... rows, up to Y */
@@ -1277,8 +1342,10 @@ static void write_output(void) {
 
 int main(void) {
     int c;
+    set_weights(wCons);
     read_input();
     compress_time();
+    CALIB_MARK("read");
     occ = calloc((size_t)(Xc > 0 ? Xc : 1) * W, sizeof(u64));
     cHead = malloc(sizeof(int) * (Xc + 1));
     tA = malloc(sizeof(u64) * W); tP = malloc(sizeof(u64) * W);
@@ -1288,18 +1355,27 @@ int main(void) {
     for (c = 0; c <= Xc; c++) cHead[c] = -1;
     spot_init();
     fen_init();
+    {   /* working set in bytes -> memory factor of the weights */
+        double mem = (double)Xc * (W * 8 + 16) + (double)N * 112 + (double)nOpt * (8 * W + 8);
+        memG = mem > 8e6 ? my_log(mem / 8e6) / 0.69314718055994531 : 0;
+    }
+    set_weights(wCons);
     construct();
+    CALIB_MARK("cons");
 #ifdef DEBUG
     fprintf(stderr, "construct %lld util %.3f ops %lld\n", totalProfit, (double)usedArea / ((double)Y * Xc), ops);
 #endif
+    set_weights(wLs);
     local_search();
 #ifdef DEBUG
     fprintf(stderr, "it %lld acc %lld imp %lld rem %.1f cand %.1f ", stIt, stAcc, stImp, (double)stRem / (stIt + 1), (double)stCand / (stIt + 1));
     fprintf(stderr, "final %lld util %.3f ops %lld\n", totalProfit, (double)usedArea / ((double)Y * Xc), ops);
 #endif
+    CALIB_MARK("ls");
     write_output();
+    CALIB_MARK("out");
 #ifdef CALIB
-    { int k; fprintf(stderr, "CNT"); for (k = 0; k < 12; k++) fprintf(stderr, " %lld", cnt[k]); fprintf(stderr, "\n"); }
+    { int k; fprintf(stderr, "CNT"); for (k = 0; k < 15; k++) fprintf(stderr, " %lld", cnt[k]); fprintf(stderr, "\n"); }
 #endif
     return 0;
 }
