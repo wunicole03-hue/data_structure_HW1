@@ -835,12 +835,21 @@ static void set_mode(int m) {
  * checkpoints the cost per user of the recent segment is projected over
  * the remaining users and the cheapest sufficient mode is chosen.
  */
+#ifndef LA_CORE
+#define LA_CORE 8                   /* lookahead for the users that fill the grid */
+#endif
+#ifndef CORE_FRAC
+#define CORE_FRAC 1.0
+#endif
 static void build_pass(int n, ll budget) {
     ll start = ops, segOps = ops;
     int i, seg = n / 256 + 1, segI = 0;
+    double area = 0, core = CORE_FRAC * Y * (double)Xc;
     set_mode(0);
     for (i = 0; i < n; i++) {
         int u = order[i];
+        if (curMode == 0) lookMul = area < core ? LA_CORE : LA_MUL;
+        area += (double)oK[U[u].o0] * S;
         if (i - segI >= seg) {
             double per = (double)(ops - segOps) / (i - segI) / modeCost[curMode];
             double left = (double)(budget - (ops - start));
@@ -869,15 +878,36 @@ static void save_best(void);
 static void restore_best(void);
 static ll snapP = -1;               /* profit of the saved best solution */
 
+static double *prio;                /* construction priorities */
+
+static int cmp_prio(const void *a, const void *b) {
+    int i = *(const int *)a, j = *(const int *)b;
+    if (prio[i] != prio[j]) return prio[i] > prio[j] ? -1 : 1;
+    return i - j;
+}
+
+#ifndef SWO_FRAC
+#define SWO_FRAC 0.4                /* squeaky-wheel rounds while under this share */
+#endif
+#ifndef SWO_STALL
+#define SWO_STALL 15                /* rounds without a better solution */
+#endif
+#ifndef SWO_LOG
+#define SWO_LOG 0.18                /* log of the priority boost per round */
+#endif
+
 /*
- * Greedy constructions with different orders while they are cheap; the
- * best one is kept.
+ * Greedy constructions.  First with different exponents of the profit /
+ * area order, then "squeaky wheel" rounds: starting from the best order,
+ * every user left out gets a higher priority and the greedy is run again.
+ * The best solution is kept.
  */
 static void construct(void) {
-    int i, n = 0, v;
-    ll budget = (ll)(WORK_LIMIT * CONS_FRAC), start = ops, first = 0;
+    int i, n = 0, v, bestV = 0, vBest = 0;
+    ll budget = (ll)(WORK_LIMIT * CONS_FRAC), start = ops, first = 0, last;
     order = malloc(sizeof(int) * (N + 1));
-    if (!order) exit(1);
+    prio = malloc(sizeof(double) * (N + 1));
+    if (!order || !prio) exit(1);
     snap_alloc();
     for (i = 0; i < N; i++) if (U[i].no) order[n++] = i;
     for (v = 0; v < (int)(sizeof consAlpha / sizeof consAlpha[0]); v++) {
@@ -888,14 +918,36 @@ static void construct(void) {
         }
         curAlpha = consAlpha[v];
         qsort(order, n, sizeof(int), cmp_cand);
-        OPS(8, 20LL * n);
+        OPS(K_RUIN, 20LL * n);
         build_pass(n, budget - (ops - start));
         if (v == 0) first = ops - t0;
 #ifdef DEBUG
         fprintf(stderr, "c%d=%lld ", v, totalProfit);
 #endif
-        if (totalProfit > snapP) save_best();
+        if (totalProfit > snapP) { save_best(); bestV = v; }
     }
+    /* squeaky wheel from the best exponent */
+    for (i = 0; i < N; i++) prio[i] = U[i].lp - consAlpha[bestV] * U[i].la;
+    last = first;
+    for (v = 0; ops - start + last + last / 4 <= (ll)(WORK_LIMIT * SWO_FRAC) && v - vBest <= SWO_STALL; v++) {
+        ll t0 = ops;
+        int left = 0;
+        if (v == 0) restore_best();         /* continue from the best solution */
+        for (i = 0; i < n; i++) if (!U[order[i]].asg) { prio[order[i]] += SWO_LOG; left++; }
+        if (!left) break;                   /* everybody is served */
+        for (i = 0; i < N; i++) if (U[i].first >= 0) remove_user(i);
+        qsort(order, n, sizeof(int), cmp_prio);
+        OPS(K_RUIN, 20LL * n);
+        build_pass(n, budget - (ops - start));
+        last = ops - t0;
+#ifdef DEBUG
+        if (totalProfit > snapP) fprintf(stderr, "s%d=%lld ", v, totalProfit);
+#endif
+        if (totalProfit > snapP) { save_best(); vBest = v; }
+    }
+#ifdef DEBUG
+    fprintf(stderr, "swo %d ", v);
+#endif
     if (snapP > totalProfit) restore_best();
     curAlpha = 1.0;
 }
