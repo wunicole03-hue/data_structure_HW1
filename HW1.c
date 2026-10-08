@@ -43,7 +43,16 @@ typedef long long ll;
 #define OPT_NUM 3
 #define OPT_DEN 2
 #define OPT_ADD 1
-#define WORK_LIMIT 88000000000LL   /* total work budget (0.1 ns units)        */
+/*
+ * Total work budget in 0.1 ns units (about 6 s with optimisation).  A build
+ * without optimisation runs up to 4 times slower per unit, so it gets less.
+ */
+#ifdef __OPTIMIZE__
+#define WORK_LIMIT 60000000000LL
+#else
+#define WORK_LIMIT 25000000000LL
+#endif
+#define WORK_HARD (WORK_LIMIT + WORK_LIMIT / 20)   /* no placement goes past this */
 #define MAXEVAL 1000000         /* most spots scored per RB               */
 #define LA_MIN 32               /* ...but at least this many columns       */
 #define LA_MUL 8                /* lookahead after the first fit, in RB widths */
@@ -518,7 +527,7 @@ static void ensure_pos(int k) {
 static ll trial(int s, int k, const u64 *M, int ca, int cb) {
     int h = shH[s], w = shW[s], last = cb - w + 1, x = ca, r, j;
     ll sum = 0;
-    for (r = 0; r < k; r++) {
+    for (r = 0; r < k && ops < WORK_HARD; r++) {
         int xf, xe, xx, bestC = -1, by = 0, bx = 0, ne = 0;
         x = next_spot(s, x, last);
         while (x <= last && !candidates(x, h, w, M)) x = next_spot(s, x + 1, last);
