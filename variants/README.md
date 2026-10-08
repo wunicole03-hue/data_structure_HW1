@@ -84,3 +84,11 @@ budget-bound runs never worse; small inputs mean +0.7% to +1.0% (a few -1% to -6
 | S_fast52.c | the same with OPS_LIMITV 52e9 |
 | S_fast50_r12.c | S_fast50 with options limited to 1.2x the fewest RBs |
 | S_fast50_r20.c | S_fast50 with options limited to 2x the fewest RBs |
+
+## Submission
+
+HW1.c is now T_ops52.c (best judge total so far, 2,363,342; max time under 13.6 s).
+It follows the rules: builds with the default options alone (`gcc HW1.c`, no warnings
+with -Wall -Wextra -pedantic, no -lm needed), has no #pragma, no compiler-specific code,
+no #ifdef / #ifndef knobs, no random numbers, no clock or time calls and no hand-written
+generator: every choice comes from the input and a fixed operation counter.

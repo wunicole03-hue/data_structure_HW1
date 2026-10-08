@@ -1,42 +1,37 @@
 /*
- * Programming Project #1 : 2D Resource Allocation Problem with NR
+ * Data Structures Programming Project #1: 2D Resource Allocation Problem with NR
  *
- * Approach:
- *   1. For every user, precompute "options": a bit threshold b gives the
- *      usable rows (bits >= b) and the number of RBs k = ceil(D / (S*b)).
- *      Dominated options are dropped, so options are sorted by k ascending.
- *   2. Placement of one user: for the cheapest feasible option, place its k
- *      RBs one by one.  Columns are scanned from the arrival time using a
- *      per-shape "free spot exists" bitset; after the first fit the scan
- *      looks ahead a bounded distance and keeps the corner position with the
- *      highest contact ratio (touching occupied cells / borders);
- *      all RBs of one request use the same shape (safe numerology rule).
- *      A dry first-fit run (nothing marked) first drops the shapes that
- *      cannot hold all k RBs, so few placements fail half way.
- *      Cheap mode (used when the work budget cannot afford the lookahead for
- *      every request): first fit found by a dry run that does not touch the
- *      grid, and the request's RBs merged into a few rectangles that are
- *      marked once each.  Masks of shapes this mode rarely uses are not kept
- *      up to date meanwhile; they are rebuilt from the occupancy when needed.
- *   3. Initial solution: greedy over several priority orders
- *      (profit / area^alpha), keep the best.  When the demand is several
- *      times the grid, the leading requests that fill it get a long
- *      lookahead (they decide the profit; the rest mostly fail).  Options
- *      needing more than MAX_RB RBs are separate items: each is tried (cheap
- *      mode) when the greedy reaches its own profit per area.
- *   4. Improvement: ruin-and-recreate.  All users inside a region (time strip
- *      x row band) are removed and the region is refilled by priority
- *      (removed + unassigned users).  A move is kept if profit increases, or
- *      stays equal with less used area.  Region shapes are swept with one
- *      cursor each, and short segments of work are shared out among the
- *      shapes in proportion to their recent gain.  Once the sweep stalls, each
- *      refill also tries leaving out one of the requests it placed (one
- *      discrepancy); when that stalls too, a threshold phase follows: refill
- *      orders are enumerated in a fixed cycle and a refill losing at most a
- *      threshold (falling to zero) is kept; the best solution is the answer.
- *   Fully deterministic: no randomness, no clock.  All work is bounded by an
- *   operation counter whose costs follow the measured run time.
- *   No input range is assumed: every array is sized from the input.
+ * Grid: Y rows (frequency) x X columns (time).  An RB is an h x w block with
+ * h * w = S.  User i needs k RBs on rows whose bits are >= some threshold b,
+ * inside its window [arr, dl]; every RB of one user has the same shape (or the
+ * shapes do not overlap in time).  Goal: maximise the total served profit.
+ *
+ * 1. Setup
+ *    - Shapes: every divisor h of S with h <= Y and S / h <= X.
+ *    - Options of a user: for each threshold b (high to low), usable rows =
+ *      rows with bits >= b and k = ceil(ceil(D / S) / b).  Options are kept by
+ *      k ascending (at most 8; k > MAX_RB goes to separate "big" options).
+ *    - Time axis compression: columns that no window covers are removed.
+ *    - Priority orders: profit / minArea^alpha and a few other keys.
+ * 2. Placing one user (place_user)
+ *    - Options in order (fewest RBs first).  A dry first-fit run (nothing
+ *      marked) keeps only the shapes that can hold all k RBs; if the best shape
+ *      is one RB short, two shapes are used one after the other in time.
+ *    - Normal mode: RB by RB, scan from the earliest free column, look ahead
+ *      LOOK_MUL widths more and keep the spot touching the most occupied cells
+ *      or borders per (h + w).
+ *    - Cheap mode (budget is short): take the first-fit spots of the dry run.
+ * 3. Construction (greedy): users in priority order.  At checkpoints the cost
+ *    of the rest is projected; if it does not fit the budget, the cheap mode is
+ *    used so that every user is still reached.  Extra constructions with wider
+ *    lookahead run while the budget allows; the best one is kept.
+ * 4. Local search: ruin-and-recreate over regions (time strip x row band),
+ *    keep a refill if profit grows (or equal profit, less area).  When it
+ *    stalls: one discrepancy per refill, then threshold accepting with the best
+ *    solution kept.
+ *
+ * Fully deterministic: no randomness and no clock.  Time is controlled by an
+ * operation counter (ops) whose costs follow the measured run time.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,73 +39,46 @@
 
 typedef unsigned long long u64;
 
-#define NVAR 9                      /* number of priority orders          */
-#define MAXSH 32                    /* shapes kept (bitmask in unsigned)  */
-#ifndef OPS_LIMITV
-#define OPS_LIMITV 50000000000LL
-#endif
-#ifndef WIDE_LIMITV
-#define WIDE_LIMITV 15000000000LL   /* the wider-lookahead construction may run up to here */
-#endif
-#ifndef NORM_LIMITV
-#define NORM_LIMITV 24000000000LL
-#endif
-#define BUDGET(v) (v)
-#define NORM_LIMIT BUDGET(NORM_LIMITV)
-#define OPS_LIMIT BUDGET(OPS_LIMITV)      /* soft work budget                   */
-#define OPS_HARD  (OPS_LIMIT + BUDGET(1100000000LL))      /* hard work budget                   */
-#define MEM_GRID  900000000.0
-#define MAX_COLS  30000000LL        /* most columns the grid keeps */      /* bytes allowed for the grid levels  */
-#ifndef MAX_RB
-#define MAX_RB    64                 /* max RBs per user in the normal passes */
-#endif
-#ifndef BIG_RB
-#define BIG_RB    1048576            /* requests needing more: separate items, at their own profit per area */
-#endif
-#ifndef SETUP_PER_BYTE
-#define SETUP_PER_BYTE 24           /* charged work per input byte (parse + options) */
-#endif
-#ifndef MARK_COST
-#define MARK_COST 600
-#define USER_COST 250
-#define UNDO_COST 100
-#ifndef UNION_RB_COST
-#define UNION_RB_COST 700           /* each RB merged into a bigger rectangle */
-#endif
-#ifndef STALE_DIV
-#define STALE_DIV 32                /* stale-shape retries: at most 1/STALE_DIV of the cheap work */
-#endif
-#ifndef LEAN_MUL4
-#define LEAN_MUL4 5                 /* cheap-mode work is charged LEAN_MUL4/4 times */
-#endif
-#define MARK_ON_COST 1500           /* same fixed charge for marking (calibrate later) */               /* cache-miss cost of one RB (un)marking */
-#endif
-#ifndef LONG_LOOK
-#define LONG_LOOK 128               /* the first construction starts the core with this lookahead */
-#endif
-#ifndef LONG_MIN
-#define LONG_MIN 16                 /* ...halved down to this while it would not reach the end of the core */
-#endif
-#ifndef LONG_LOAD
-#define LONG_LOAD 2                 /* ...only when the demand is at least this many times the grid */
-#endif
-#ifndef LONG_CORE100
-#define LONG_CORE100 100            /* ...for the leading requests whose smallest areas fill this % of the grid */
-#endif
-#ifndef LONG_FRAC100
-#define LONG_FRAC100 75             /* ...while it has used at most this % of the budget */
-#endif
-#ifndef LOOK_MULV
-#define LOOK_MULV 4
-#endif
-#define LOOK_MUL  LOOK_MULV                /* lookahead (in RB widths) after the first fit */
-#ifndef LNS_LOOK
-#define LNS_LOOK LOOK_MUL           /* lookahead of the local search refills */
-#endif
+/* ---------- parameters ---------- */
+
+/* work budgets (operation counter) */
+#define OPS_LIMITV  52000000000LL   /* first construction                         */
+#define NORM_LIMITV 24000000000LL   /* extra constructions and local search        */
+#define WIDE_LIMITV 15000000000LL   /* wider-lookahead construction                */
+#define OPS_LIMIT   OPS_LIMITV
+#define NORM_LIMIT  NORM_LIMITV
+#define OPS_HARD    (OPS_LIMIT + 1100000000LL)   /* placements abort past this     */
+
+/* charged costs (calibrated to the measured run time) */
+#define SETUP_PER_BYTE 24           /* per input byte (parse + options)           */
+#define MARK_COST      600          /* clearing one RB                            */
+#define MARK_ON_COST   1500         /* marking one RB                             */
+#define USER_COST      250          /* per placement attempt                      */
+#define UNDO_COST      100          /* per RB taken back                          */
+#define UNION_RB_COST  700          /* each RB merged into a bigger rectangle     */
+#define LEAN_MUL4      5            /* cheap-mode work is charged LEAN_MUL4/4 times */
+#define STALE_DIV      32           /* stale-shape rebuilds: <= 1/STALE_DIV of cheap work */
+
+/* problem limits and memory */
+#define NVAR      9                 /* number of priority orders                  */
+#define MAXSH     32                /* shapes kept (bitmask in unsigned)          */
+#define MAX_RB    64                /* max RBs per user in the normal passes      */
+#define BIG_RB    1048576           /* more RBs: "big" options, tried separately  */
+#define MAX_COLS  30000000LL        /* most columns the grid keeps                */
+#define MEM_GRID  900000000.0       /* bytes for the occupancy and shape masks    */
+#define MEM_OWN   500000000.0       /* bytes for the owner grid                   */
+#define MEM_ROW   300000000.0       /* bytes for the row-major occupancy          */
+#define MEM_OPT   300000000.0       /* bytes for the option masks                 */
+
+/* lookahead (in RB widths after the first fit) */
+#define LOOK_MUL     2              /* construction                               */
+#define LNS_LOOK     4              /* local search refills                       */
+#define LONG_LOOK    128            /* long lookahead for the "core" users ...    */
+#define LONG_MIN     16             /* ... halved down to this while too slow     */
+#define LONG_LOAD    2              /* ... only if demand >= LONG_LOAD x grid     */
+#define LONG_CORE100 100            /* ... core = leading users filling this % of the grid */
+#define LONG_FRAC100 75             /* ... while it used <= this % of the budget  */
 static long long lookMul = LOOK_MUL;
-#define MEM_OWN   500000000.0       /* bytes allowed for the owner grid   */
-#define MEM_ROW   300000000.0       /* bytes allowed for row-major occupancy */
-#define MEM_OPT   300000000.0       /* bytes allowed for option masks     */
 
 typedef struct {
     int h, w;       /* frequency size, time size */
@@ -130,57 +98,58 @@ typedef struct {
     RB *rbs;
 } User;
 
-static int Y, X, S, N, W;
-static int nsh, shH[MAXSH], shW[MAXSH];
-static int shLj[MAXSH], shOff[MAXSH];   /* log2(w) and w - 2^log2(w) per shape */
+/* ---------- global state ---------- */
+
+static int Y, X, S, N, W;           /* W = 64-bit words per column (rows)         */
+static int nsh, shH[MAXSH], shW[MAXSH];         /* shapes                        */
 static int shStep[MAXSH][40], shNStep[MAXSH];   /* shift sequence of runs() for h */
+static unsigned usedSh = ~0U;       /* shapes some user can use (others: no masks) */
+static long long levSpan;           /* fixed charge per marking (time scale)      */
+static int levCnt;
 static User *U;
-static u64 *lev[32];        /* lev[j][x] = OR of columns x..x+2^j-1   */
-static int nlev;
-static unsigned usedSh = ~0U;
-static long long levSpan; static int levCnt;   /* charge-only stand-in for the old OR levels */  /* shapes some request can use (others need no masks) */
-static u64 *col;            /* occupancy, column-major: X * W words   */
-static RB *tmpRB;
-static u64 *fz[MAXSH];      /* fz[s] bit x: some h*w free spot starts at column x */
-static u64 *fzs[MAXSH];     /* fzs[s] bit i: word i of fz[s] is non-zero (skips empty stretches) */
-static int fzsWords;
+static RB *tmpRB;                   /* RBs of the placement in progress           */
+
+/* grid structures */
+static u64 *col;            /* occupancy, column-major: X * W words              */
+static u64 *fm[MAXSH];      /* fm[s][x]: rows y where an h*w block at (x, y) is free */
+static u64 *fz[MAXSH];      /* fz[s] bit x: some free spot of shape s starts at column x */
+static u64 *fzs[MAXSH];     /* fzs[s] bit i: word i of fz[s] is non-zero           */
+static int fzWords, fzsWords;
+static long long *fen;      /* Fenwick tree: occupied cells per 64-column block  */
+static int *own;            /* owner user of each cell (x*Y+y), or -1            */
+static int useOwn, ownLive = 1;     /* ownLive = 0: owner grid rebuilt later     */
+static u64 *rowOcc;         /* row-major occupancy: rowOcc[y*fzWords + x/64]     */
+static int useRow;
+static int curOwner = -1;   /* user whose RBs are being marked                   */
 static void fzs_fix(int s, int w0, int w1);
 
 /*
- * Journal of the derived words (free-start masks, their column flags and
- * summary) changed while one request is being placed.  Taking back RBs of
- * an unfinished placement restores these words instead of recomputing them.
+ * Journal of the mask words changed while one user is being placed: taking
+ * back the RBs of an unfinished placement restores them instead of
+ * recomputing them.
  */
 static u64 **jPtr, *jVal;
 static long long jLen, jCap, *tmpJ;
 static int jOn, jOk;
 
-static void jpush(u64 *p)
-{
+static void jpush(u64 *p) {
     if (jLen < jCap) { jPtr[jLen] = p; jVal[jLen] = *p; jLen++; }
     else jOk = 0;
 }
 
-static u64 *fm[MAXSH];      /* fm[s][x]: rows y where an h*w block at (x, y) is free */
-static int fzWords;
-static long long *fen;      /* Fenwick tree: occupied cells per column        */
-static int *own;            /* owner user of each cell (x*Y+y), or -1         */
-static int useOwn, ownLive = 1, ownValid = 1;   /* ownLive = 0: owner grid rebuilt later */
-static u64 *scAll, *scMp, *scMn, *scMm, *scGs;
-static int curOwner = -1;   /* user whose RBs are being marked               */
-static u64 *rowOcc;         /* row-major occupancy: rowOcc[y*fzWords + x/64] */
-static int useRow;
-static long long ops;
-static long long hardLimit = 9000000000000000000LL;  /* abort placements past this */
-static long long opsEnd;    /* end of the local search budget */
+/* budget and solution */
+static long long ops;                               /* operation counter     */
+static long long hardLimit = 9000000000000000000LL; /* abort placements past this */
+static long long opsEnd;                            /* end of the local search */
 static long long curProfit, curArea;
-static int *order[NVAR], *rankv[NVAR];
-static int nVar = NVAR;     /* priority orders actually used (fewer for huge N) */
+static int *order[NVAR], *rankv[NVAR];  /* priority orders and ranks            */
+static int nVar = NVAR;     /* priority orders actually used (fewer for huge N)  */
 static double *keyBuf;
 static int maxOpt;
 
 /* scratch row masks (W words each) */
-static u64 *scT, *scRm1, *scRm2, *scOcc, *scFr, *scSl, *scSr, *scCand, *scG, *scM, *scPend, *scTail, *scBig1, *scBig2;
+static u64 *scT, *scRm1, *scRm2, *scFr, *scG, *scM, *scPend, *scTail, *scBig1, *scBig2;
+static u64 *scAll, *scMp, *scMn, *scMm, *scGs;
 
 /* ---------- fast input ---------- */
 
@@ -192,8 +161,7 @@ static long long inTotal;
 static int ieof;
 
 /* at least 64 unread bytes in the buffer, unless the input has ended */
-static void iensure(void)
-{
+static void iensure(void) {
     if (ilen - ipos >= 64 || ieof) return;
     memmove(ibuf, ibuf + ipos, ilen - ipos);
     ilen -= ipos; ipos = 0;
@@ -205,8 +173,7 @@ static void iensure(void)
     ibuf[ilen] = 0;
 }
 
-static int read_ll(long long *out)
-{
+static int read_ll(long long *out) {
     const char *p;
     int neg = 0;
     long long v = 0;
@@ -231,22 +198,80 @@ static int read_ll(long long *out)
     return 1;
 }
 
-static int clamp_int(long long v)
-{
+static int clamp_int(long long v) {
     if (v > 2000000000LL) return 2000000000;
     if (v < -2000000000LL) return -2000000000;
     return (int)v;
 }
 
-static int ilog2(long long v)
-{
+static int ilog2(long long v) {
     int r = 0;
     while (v > 1) { v >>= 1; r++; }
     return r;
 }
 
-/* ---------- multi-word row-mask helpers ---------- */
+/* ---------- small utilities ---------- */
 
+static int cmp_int(const void *p, const void *q) {
+    int a = *(const int *)p, b = *(const int *)q;
+    return (a > b) - (a < b);
+}
+
+static int cmp_by_id(const void *p, const void *q) {
+    int a = *(const int *)p, b = *(const int *)q;
+    if (U[a].id != U[b].id) return U[a].id < U[b].id ? -1 : 1;
+    return (a > b) - (a < b);
+}
+
+static void print_empty(void) {
+    printf("0 0\n");
+}
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n ? n : 1);
+    if (!p) { print_empty(); exit(0); }
+    return p;
+}
+
+static void *xcalloc(size_t n, size_t sz) {
+    void *p = calloc(n ? n : 1, sz ? sz : 1);
+    if (!p) { print_empty(); exit(0); }
+    return p;
+}
+
+/* ---------- buffered output ---------- */
+
+#define OUT_CAP (1 << 20)
+static char *outBuf;
+static size_t outLen;
+
+static void out_flush(void) {
+    if (outLen) fwrite(outBuf, 1, outLen, stdout);
+    outLen = 0;
+}
+
+/* make room for n more bytes */
+static void out_room(size_t n) {
+    if (outLen + n > OUT_CAP) out_flush();
+}
+
+static void out_c(char c) {
+    if (outLen + 1 > OUT_CAP) out_flush();
+    outBuf[outLen++] = c;
+}
+
+static void out_ll(long long v) {
+    char tmp[24];
+    int n = 0;
+    unsigned long long u;
+    if (outLen + 24 > OUT_CAP) out_flush();
+    if (v < 0) { outBuf[outLen++] = '-'; u = (unsigned long long)(-(v + 1)) + 1ULL; }
+    else u = (unsigned long long)v;
+    do { tmp[n++] = (char)('0' + (int)(u % 10)); u /= 10; } while (u);
+    while (n) outBuf[outLen++] = tmp[--n];
+}
+
+/* ---------- bit helpers ---------- */
 
 static const int debruijnTab[64] = {
     0, 1, 48, 2, 57, 49, 28, 3, 61, 58, 50, 42, 38, 29, 17, 4,
@@ -254,21 +279,22 @@ static const int debruijnTab[64] = {
     63, 47, 56, 27, 60, 41, 37, 16, 54, 35, 52, 21, 44, 32, 23, 11,
     46, 26, 40, 15, 34, 20, 31, 10, 25, 14, 19, 9, 13, 8, 7, 6
 };
-static int ctz64(u64 v)     /* index of lowest set bit, v != 0 */
-{
+
+/* index of lowest set bit, v != 0 */
+static int ctz64(u64 v) {
     return debruijnTab[((v & (0 - v)) * 0x03F79D71B4CB0A89ULL) >> 58];
 }
 
-static int popc(u64 v)      /* number of set bits (portable) */
-{
+/* number of set bits (portable) */
+static int popc(u64 v) {
     v = v - ((v >> 1) & 0x5555555555555555ULL);
     v = (v & 0x3333333333333333ULL) + ((v >> 2) & 0x3333333333333333ULL);
     v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
     return (int)((v * 0x0101010101010101ULL) >> 56);
 }
 
-static void shr_k(u64 *d, const u64 *s, int k)   /* bit y of d = bit y+k of s */
-{
+/* bit y of d = bit y+k of s */
+static void shr_k(u64 *d, const u64 *s, int k) {
     int ws = k >> 6, bs = k & 63, i;
     for (i = 0; i < W; i++) {
         int j = i + ws;
@@ -281,10 +307,8 @@ static void shr_k(u64 *d, const u64 *s, int k)   /* bit y of d = bit y+k of s */
     }
 }
 
-
 /* d = rows y such that rows y..y+h-1 are all set in f */
-static void runs(u64 *d, const u64 *f, int h)
-{
+static void runs(u64 *d, const u64 *f, int h) {
     int len = 1, i;
     for (i = 0; i < W; i++) d[i] = f[i];
     while (len < h) {
@@ -296,8 +320,7 @@ static void runs(u64 *d, const u64 *f, int h)
 }
 
 /* runs() for the height of shape s (one word: the precomputed shifts) */
-static void runs_s(u64 *d, const u64 *f, int s)
-{
+static void runs_s(u64 *d, const u64 *f, int s) {
     if (W == 1) {
         u64 v = f[0];
         int t;
@@ -308,16 +331,14 @@ static void runs_s(u64 *d, const u64 *f, int s)
     runs(d, f, shH[s]);
 }
 
-static int is_zero(const u64 *a)
-{
+static int is_zero(const u64 *a) {
     int i;
     for (i = 0; i < W; i++) if (a[i]) return 0;
     return 1;
 }
 
 /* fills only words (y>>6) .. ((y+h-1)>>6) of d */
-static void row_mask(u64 *d, int y, int h)
-{
+static void row_mask(u64 *d, int y, int h) {
     int i, i1 = (int)(((long long)y + h - 1) >> 6);
     for (i = y >> 6; i <= i1; i++) {
         long long lo = (long long)y - (long long)i * 64, hi = (long long)y + h - (long long)i * 64;
@@ -328,8 +349,7 @@ static void row_mask(u64 *d, int y, int h)
     }
 }
 
-static int bit_at(int x, int y)
-{
+static int bit_at(int x, int y) {
     return (int)((col[(size_t)x * W + (size_t)(y >> 6)] >> (y & 63)) & 1ULL);
 }
 
@@ -337,13 +357,12 @@ static int bit_at(int x, int y)
 
 static int nBlk;             /* number of 64-column blocks */
 
-static void fen_add(int x, long long v)
-{
+static void fen_add(int x, long long v) {
     for (x++; x <= nBlk; x += x & (-x)) fen[x] += v;
 }
 
-static long long fen_pref(int x)        /* sum of columns 0..x-1 */
-{
+/* sum of columns 0..x-1 */
+static long long fen_pref(int x) {
     long long r = 0;
     for (; x > 0; x -= x & (-x)) r += fen[x];
     return r;
@@ -357,8 +376,7 @@ static long long fen_pref(int x)        /* sum of columns 0..x-1 */
  */
 static u64 *vhP, *vhS;      /* scratch, (3 * maxShW + 64) * W words each */
 
-static void fz_update(int s, long long lo, long long hi)
-{
+static void fz_update(int s, long long lo, long long hi) {
     int x, xm = X - shW[s], ws = shW[s], n, span, i, k, t;
     if (lo < 0) lo = 0;
     if (hi > xm) hi = xm;
@@ -425,8 +443,7 @@ static void fz_update(int s, long long lo, long long hi)
 }
 
 /* refresh the summary bits of fz[s] words w0..w1 */
-static void fzs_fix(int s, int w0, int w1)
-{
+static void fzs_fix(int s, int w0, int w1) {
     const u64 *z = fz[s];
     u64 *q = fzs[s];
     int i;
@@ -436,10 +453,8 @@ static void fzs_fix(int s, int w0, int w1)
     }
 }
 
-
 /* bits [x0, x1] of a row bitset: set (on=1), clear (on=0) */
-static void row_range(u64 *rw, int x0, int x1, int on)
-{
+static void row_range(u64 *rw, int x0, int x1, int on) {
     int wi;
     for (wi = x0 >> 6; wi <= (x1 >> 6); wi++) {
         int lo = wi == (x0 >> 6) ? (x0 & 63) : 0, hi = wi == (x1 >> 6) ? (x1 & 63) : 63;
@@ -448,8 +463,7 @@ static void row_range(u64 *rw, int x0, int x1, int on)
     }
 }
 
-static int row_count(const u64 *rw, int x0, int x1)
-{
+static int row_count(const u64 *rw, int x0, int x1) {
     int wi, c = 0;
     if ((x0 >> 6) == (x1 >> 6))
         return popc(rw[x0 >> 6] & (~0ULL << (x0 & 63)) & (~0ULL >> (63 - (x1 & 63))));
@@ -461,22 +475,15 @@ static int row_count(const u64 *rw, int x0, int x1)
     return c;
 }
 
-static u64 *scSm;   /* scratch: start-row mask */
+/* ---------- marking RBs on the grid ---------- */
+
+static u64 *scSm;           /* scratch: start-row mask */
 static int markOnly = -1;   /* >= 0: marking updates only this shape's masks */
 
-
-
-/*
- * Mark (on=1) or clear (on=0) one RB in every structure.
- * Marking only removes free space, so the OR levels and the free-start
- * masks are updated with a single OR / AND-NOT per column; clearing has to
- * rebuild them from the occupancy below.
- */
-/* occupancy, owners, block counts and row bits of one RB (no derived masks) */
-static void mark_raw(const RB *r, int on)
-{
-    int c, i;
-    int w0 = r->y >> 6, w1 = (r->y + r->h - 1) >> 6;
+/* occupancy, owners, block counts and row bits of one RB (no shape masks) */
+static void mark_raw(const RB *r, int on) {
+    int c, i, bb;
+    int w0 = r->y >> 6, w1 = (r->y + r->h - 1) >> 6, b0 = r->x >> 6, b1 = (r->x + r->w - 1) >> 6;
     row_mask(scRm2, r->y, r->h);
     for (c = r->x; c < r->x + r->w; c++) {
         u64 *p = col + (size_t)c * W;
@@ -486,142 +493,89 @@ static void mark_raw(const RB *r, int on)
             for (i = 0; i < r->h; i++) o[i] = v;
         }
     }
-    {
-        int b0 = r->x >> 6, b1 = (r->x + r->w - 1) >> 6, bb;
-        for (bb = b0; bb <= b1; bb++) {
-            int lo2 = bb == b0 ? r->x : bb << 6, hi2 = bb == b1 ? r->x + r->w - 1 : (bb << 6) + 63;
-            fen_add(bb, (long long)(hi2 - lo2 + 1) * (on ? r->h : -r->h));
-        }
+    for (bb = b0; bb <= b1; bb++) {
+        int lo2 = bb == b0 ? r->x : bb << 6, hi2 = bb == b1 ? r->x + r->w - 1 : (bb << 6) + 63;
+        fen_add(bb, (long long)(hi2 - lo2 + 1) * (on ? r->h : -r->h));
     }
     if (useRow) for (i = 0; i < r->h; i++) row_range(rowOcc + (size_t)(r->y + i) * fzWords, r->x, r->x + r->w - 1, on);
 }
 
 /* free-start masks of shape s after RB r was marked; returns the columns touched */
-static long long mark_shape_on(const RB *r, int s)
-{
-    int c, i;
+static long long mark_shape_on(const RB *r, int s) {
+    int c, i, xm = X - shW[s], hs = shH[s], s0, s1;
     long long lo = (long long)r->x - shW[s] + 1, hi = (long long)r->x + r->w - 1, y0;
-        int xm = X - shW[s], hs = shH[s];
-        u64 *F = fm[s], *Z = fz[s];
-        if (lo < 0) lo = 0;
-        if (hi > xm) hi = xm;
-        if (lo > hi) return 0;
-        y0 = (long long)r->y - hs + 1;
-        if (y0 < 0) y0 = 0;
-        row_mask(scSm, (int)y0, (int)((long long)r->y + r->h - y0));
-        {
-            int s0 = (int)(y0 >> 6), s1 = (r->y + r->h - 1) >> 6;
-            if (W == 1) {
-                u64 m = ~scSm[0];
-                if (jOn) {
-                    for (c = (int)lo; c <= (int)hi; c++) {
-                        u64 v = F[c] & m;
-                        if (v != F[c]) {
-                            jpush(F + c);
-                            F[c] = v;
-                            if (!v) { jpush(Z + (c >> 6)); Z[c >> 6] &= ~(1ULL << (c & 63)); }
-                        }
-                    }
-                } else {
-                    for (c = (int)lo; c <= (int)hi; c++) {
-                        u64 v = F[c] & m;
-                        F[c] = v;
-                        if (!v) Z[c >> 6] &= ~(1ULL << (c & 63));
-                    }
-                }
-            } else {
-                for (c = (int)lo; c <= (int)hi; c++) {
-                    u64 *f = F + (size_t)c * W, nz = 0, ch = 0;
-                    for (i = s0; i <= s1; i++) {
-                        u64 v = f[i] & ~scSm[i];
-                        if (v != f[i]) { if (jOn) jpush(f + i); f[i] = v; ch = 1; }
-                    }
-                    if (ch) {
-                        for (i = 0; i < W; i++) nz |= f[i];
-                        if (!nz && ((Z[c >> 6] >> (c & 63)) & 1ULL)) {
-                            if (jOn) jpush(Z + (c >> 6));
-                            Z[c >> 6] &= ~(1ULL << (c & 63));
-                        }
-                    }
-                }
+    u64 *F = fm[s], *Z = fz[s];
+    if (lo < 0) lo = 0;
+    if (hi > xm) hi = xm;
+    if (lo > hi) return 0;
+    y0 = (long long)r->y - hs + 1;
+    if (y0 < 0) y0 = 0;
+    row_mask(scSm, (int)y0, (int)((long long)r->y + r->h - y0));   /* start rows now blocked */
+    s0 = (int)(y0 >> 6); s1 = (r->y + r->h - 1) >> 6;
+    if (W == 1) {
+        u64 m = ~scSm[0];
+        if (jOn) {
+            for (c = (int)lo; c <= (int)hi; c++) {
+                u64 v = F[c] & m;
+                if (v == F[c]) continue;
+                jpush(F + c);
+                F[c] = v;
+                if (!v) { jpush(Z + (c >> 6)); Z[c >> 6] &= ~(1ULL << (c & 63)); }
+            }
+        } else {
+            for (c = (int)lo; c <= (int)hi; c++) {
+                u64 v = F[c] & m;
+                F[c] = v;
+                if (!v) Z[c >> 6] &= ~(1ULL << (c & 63));
             }
         }
-        fzs_fix(s, (int)(lo >> 6), (int)(hi >> 6));
-        return hi - lo + 1;
+    } else {
+        for (c = (int)lo; c <= (int)hi; c++) {
+            u64 *f = F + (size_t)c * W, nz = 0, ch = 0;
+            for (i = s0; i <= s1; i++) {
+                u64 v = f[i] & ~scSm[i];
+                if (v != f[i]) { if (jOn) jpush(f + i); f[i] = v; ch = 1; }
+            }
+            if (!ch) continue;
+            for (i = 0; i < W; i++) nz |= f[i];
+            if (!nz && ((Z[c >> 6] >> (c & 63)) & 1ULL)) {
+                if (jOn) jpush(Z + (c >> 6));
+                Z[c >> 6] &= ~(1ULL << (c & 63));
+            }
+        }
+    }
+    fzs_fix(s, (int)(lo >> 6), (int)(hi >> 6));
+    return hi - lo + 1;
 }
 
-static void mark_rb(const RB *r, int on)
-{
-    int c, i, j, s;
-    int w0 = r->y >> 6, w1 = (r->y + r->h - 1) >> 6;
-    row_mask(scRm2, r->y, r->h);
-    for (c = r->x; c < r->x + r->w; c++) {
-        u64 *p = col + (size_t)c * W;
-        for (i = w0; i <= w1; i++) p[i] = on ? (p[i] | scRm2[i]) : (p[i] & ~scRm2[i]);
-        if (useOwn && ownLive) {
-            int *o = own + (size_t)c * Y + r->y, v = on ? curOwner : -1;
-            for (i = 0; i < r->h; i++) o[i] = v;
-        }
-    }
-    {   /* occupied cells per 64-column block */
-        int b0 = r->x >> 6, b1 = (r->x + r->w - 1) >> 6, bb;
-        for (bb = b0; bb <= b1; bb++) {
-            int lo2 = bb == b0 ? r->x : bb << 6, hi2 = bb == b1 ? r->x + r->w - 1 : (bb << 6) + 63;
-            fen_add(bb, (long long)(hi2 - lo2 + 1) * (on ? r->h : -r->h));
-        }
-    }
-    if (useRow) for (i = 0; i < r->h; i++) row_range(rowOcc + (size_t)(r->y + i) * fzWords, r->x, r->x + r->w - 1, on);
+/*
+ * Mark (on=1) or clear (on=0) one RB in every structure.  Marking only removes
+ * free space, so the masks are updated with one AND-NOT per column; clearing
+ * rebuilds them from the occupancy.
+ */
+static void mark_rb(const RB *r, int on) {
+    int s;
+    mark_raw(r, on);
     if (on) {
         long long span = 0;
-        for (j = 1; j < nlev; j++) {
-            long long lo = (long long)r->x - (1LL << j) + 1, hi = (long long)r->x + r->w - 1;
-            if (lo < 0) lo = 0;
-            if (W == 1) {
-                u64 m = scRm2[0], *L = lev[j];
-                for (c = (int)lo; c <= (int)hi; c++) L[c] |= m;
-            } else {
-                for (c = (int)lo; c <= (int)hi; c++) {
-                    u64 *dst = lev[j] + (size_t)c * W;
-                    for (i = w0; i <= w1; i++) dst[i] |= scRm2[i];
-                }
-            }
-            span += hi - lo + 1;
-        }
         for (s = 0; s < nsh; s++) {
             if (!((usedSh >> s) & 1U)) continue;
             if (markOnly >= 0 && s != markOnly) continue;   /* other shapes: applied later */
             span += mark_shape_on(r, s);
         }
-        /* charged as before the OR-level tables were dropped (keeps the time scale) */
         span += levSpan + (long long)levCnt * r->w;
         ops += (long long)r->w * (4 + (useOwn && ownLive ? r->h : 0)) + span * (W == 1 ? 5 : 2 * W + 3) + W + MARK_ON_COST;
         return;
     }
-    for (j = 1; j < nlev; j++) {
-        int half = 1 << (j - 1);
-        long long lo = (long long)r->x - (1LL << j) + 1, hi = (long long)r->x + r->w - 1;
-        if (lo < 0) lo = 0;
-        if (hi > X - 1) hi = X - 1;
-        for (c = (int)lo; c <= (int)hi; c++) {
-            u64 *dst = lev[j] + (size_t)c * W;
-            const u64 *s1 = lev[j - 1] + (size_t)c * W;
-            if ((long long)c + half < X) {
-                const u64 *s2 = lev[j - 1] + (size_t)(c + half) * W;
-                for (i = 0; i < W; i++) dst[i] = s1[i] | s2[i];
-            } else {
-                for (i = 0; i < W; i++) dst[i] = s1[i];
-            }
-        }
-    }
     for (s = 0; s < nsh; s++)
         if ((usedSh >> s) & 1U) fz_update(s, (long long)r->x - shW[s] + 1, (long long)r->x + r->w - 1);
-    ops += (long long)r->w * (nlev * W + 4 + (useOwn && ownLive ? r->h : 0)) + W + MARK_COST;
+    ops += (long long)r->w * (W + 4 + (useOwn && ownLive ? r->h : 0)) + W + MARK_COST;
 }
 
-/* ---------- placement of one request ---------- */
+/* ---------- searching a spot for one RB ---------- */
 
-static int contact(int x, int y, int h, int w)
-{
+/* contact of an h*w block at (x, y): cells on its border that are occupied or outside */
+static int contact(int x, int y, int h, int w) {
     int c = 0, i, t, w0 = y >> 6, w1 = (y + h - 1) >> 6;
     row_mask(scRm1, y, h);
     if (x == 0) c += h;
@@ -631,7 +585,6 @@ static int contact(int x, int y, int h, int w)
     if (useRow) {
         c += y == 0 ? w : row_count(rowOcc + (size_t)(y - 1) * fzWords, x, x + w - 1);
         c += (long long)y + h == Y ? w : row_count(rowOcc + (size_t)(y + h) * fzWords, x, x + w - 1);
-        (void)t;
         return c;
     }
     if (y == 0) c += w;
@@ -642,8 +595,7 @@ static int contact(int x, int y, int h, int w)
 }
 
 /* take back tentative RBs from..placed-1 (the most recent ones) */
-static void undo_range(int from, int placed)
-{
+static void undo_range(int from, int placed) {
     int i;
     if (placed <= from) return;
     if (jOn && jOk) {
@@ -660,15 +612,13 @@ static void undo_range(int from, int placed)
     }
 }
 
-static void undo_tmp(int placed)
-{
+static void undo_tmp(int placed) {
     undo_range(0, placed);
 }
 
 typedef struct { int x, y, s, c, p; } Best;
 
-static void consider(Best *b, int xx, int y, int s)
-{
+static void consider(Best *b, int xx, int y, int s) {
     int h = shH[s], w = shW[s], cc = contact(xx, y, h, w);
     ops += (h + w + 2 * W + 4) / 2;
     /* maximise cc/(h+w); ties: earlier x, lower y */
@@ -680,33 +630,10 @@ static void consider(Best *b, int xx, int y, int s)
 }
 
 /*
- * Scan shape s over the window [a, d] (only columns flagged in fz[s]),
- * from the earliest column on.  Once a valid spot is found, the scan goes
- * on for LOOK more columns and keeps the corner spot with the best contact.
- */
-static void scan_shape_core(int s, const u64 *good, int a, int a0, int d, Best *b, int *firstOut);
-
-/*
- * Within one placement attempt the grid only fills up, so a column that had
- * no valid spot for shape s stays without one: later RBs of the same request
- * resume the scan at the first valid column found before (same result).
- */
-static int scanFrom[MAXSH];
-
-static void scan_shape(int s, const u64 *good, int a, int d, Best *b)
-{
-    int first = -1, from = scanFrom[s] > a ? scanFrom[s] : a;
-    if (from > d) return;
-    scan_shape_core(s, good, a, from, d, b, &first);
-    scanFrom[s] = first >= 0 ? first : d + 1;
-}
-
-/*
  * Candidates v of column x (single word): the left/right neighbour columns
  * are read once for all of them.  Same scores and tie-breaks as consider().
  */
-static void consider_col1(Best *b, int x, u64 v, int s)
-{
+static void consider_col1(Best *b, int x, u64 v, int s) {
     int h = shH[s], w = shW[s], hw = h + w;
     u64 hm = h >= 64 ? ~0ULL : ((1ULL << h) - 1);
     int lb = x == 0, rb = (long long)x + w == X;
@@ -730,8 +657,7 @@ static void consider_col1(Best *b, int x, u64 v, int s)
  * Next word index >= wi (and <= we) of fz[s] that is non-zero, or -1.
  * Uses the summary bits; charges the summary words it reads.
  */
-static int next_word(int s, int wi, int we)
-{
+static int next_word(int s, int wi, int we) {
     int si, se;
     u64 v;
     if (wi > we) return -1;
@@ -748,8 +674,12 @@ static int next_word(int s, int wi, int we)
     return wi <= we ? wi : -1;
 }
 
-static void scan_shape_core(int s, const u64 *good, int a, int a0, int d, Best *b, int *firstOut)
-{
+/*
+ * Scan shape s over the window [a, d] (only columns flagged in fz[s]) from
+ * column a0 on.  Once a valid spot is found, the scan goes on for lookMul
+ * widths more and keeps the corner spot with the best contact ratio.
+ */
+static void scan_shape_core(int s, const u64 *good, int a, int a0, int d, Best *b, int *firstOut) {
     int w = shW[s], xmax = d - w + 1, first = -1, x, i, wi, we;
     long long look = (long long)lookMul * w, lim = xmax, visits = 0;
     u64 z;
@@ -789,8 +719,7 @@ static void scan_shape_core(int s, const u64 *good, int a, int a0, int d, Best *
         ops += visits * 4 + 2;
         *firstOut = first;
         return;
-    }
-    {                                       /* multi-word path */
+    } else {                                /* multi-word path */
         const u64 *G = scGs, *F = fm[s];
         for (;;) {
             while (z) {
@@ -841,29 +770,36 @@ static void scan_shape_core(int s, const u64 *good, int a, int a0, int d, Best *
 }
 
 /*
+ * Within one placement attempt the grid only fills up, so a column that had
+ * no valid spot for shape s stays without one: later RBs of the same request
+ * resume the scan at the first valid column found before (same result).
+ */
+static int scanFrom[MAXSH];
+
+static void scan_shape(int s, const u64 *good, int a, int d, Best *b) {
+    int first = -1, from = scanFrom[s] > a ? scanFrom[s] : a;
+    if (from > d) return;
+    scan_shape_core(s, good, a, from, d, b, &first);
+    scanFrom[s] = first >= 0 ? first : d + 1;
+}
+
+/*
  * Dry run: how many disjoint RBs of shape s first fit (earliest column, then
  * lowest row) finds for rows `good` in [a, d], without touching the grid.
  * Stops at k; the positions are left in dryRB.  Returns k as well when the
  * queue of own RBs would overflow (then dryRB is not usable: *exact = 0).
  */
 static RB *dryRB;
-#ifdef LEAN_STATS
-static long long dryOps;            /* statistics: work charged by dry runs */
-#endif
 static int *dryQx, dryCap;          /* columns of own RBs still blocking (queue) */
 static u64 *dryQ, *dryB;            /* their blocked start rows (W words each)   */
 
-static int dry_count(int s, const u64 *good, int a, int d, int k, int *exact)
-{
+static int dry_count(int s, const u64 *good, int a, int d, int k, int *exact) {
     int w = shW[s], h = shH[s], xmax = d - w + 1, cnt = 0, wi, we, x, qh = 0, qt = 0, i;
     long long visits = 0, work = 0;
     u64 z;
     *exact = 1;
     runs_s(scGs, good, s);
     ops += (long long)(ilog2(h) + 2) * W + 8;
-#ifdef LEAN_STATS
-    dryOps += (long long)(ilog2(h) + 2) * W + 8;
-#endif
     if (a > xmax || is_zero(scGs)) return 0;
     wi = a >> 6; we = xmax >> 6;
     z = fz[s][wi] & (~0ULL << (a & 63));
@@ -948,37 +884,29 @@ static int dry_count(int s, const u64 *good, int a, int d, int k, int *exact)
     }
 done:
     ops += visits * (W == 1 ? 3 : 3 + W) + work + 4;
-#ifdef LEAN_STATS
-    dryOps += visits * (W == 1 ? 3 : 3 + W) + work + 4;
-#endif
     return cnt;
 }
 
-#ifdef LEAN_STATS
-static long long leanTry, leanMerged, leanRB;   /* statistics of the cheap mode */
-#endif
-static int leanMode;
+/* ---------- cheap mode: merging a request's RBs into rectangles ---------- */
+
+static int leanMode;            /* 1: cheap mode (first fit from dry runs)        */
 static unsigned shDirty;        /* shapes whose masks are stale (cheap mode skips them) */
-static unsigned leanKeep = ~0U; /* shapes the cheap mode keeps up to date */
-static long long leanUse[MAXSH], leanUseTot;   /* cheap-mode placements per shape (this pass) */
-static long long leanWork, staleWork;           /* cheap-mode work, and the part spent on stale shapes */
+static unsigned leanKeep = ~0U; /* shapes the cheap mode keeps up to date         */
+static long long leanUse[MAXSH], leanUseTot;   /* cheap-mode placements per shape */
+static long long leanWork, staleWork;  /* cheap-mode work, part spent on stale shapes */
 static int maxShW = 1;          /* widest shape */
-static void refresh_shape(int s, long long lo, long long hi);            /* 1: first fit by dry runs only (cheap construction) */
-static RB *tmpUn;               /* RBs merged into rectangles (marked once each) */
+static void refresh_shape(int s, long long lo, long long hi);
+static RB *tmpUn;               /* RBs merged into rectangles (marked once each)  */
 static int nUn, unionPlaced;
-
-/* merge the k RBs of one shape into rectangles: runs along time in each row
-   band first, then equal runs in adjacent row bands */
-/*
- * Same for RBs in first-fit order (column by column, rows ascending), in one
- * pass: equal-shape RBs stacked in a column first, then runs that continue the
- * open rectangle starting on the same row.  Used for big requests.
- */
 static int *unOpen, *unStamp, unCur;    /* per row: open rectangle, and when set */
-static u64 *scRowsU;                    /* rows used by a request's RBs */
+static u64 *scRowsU;                    /* rows used by a request's RBs          */
 
-static void build_unions_cm(int k, int s)
-{
+/*
+ * RBs in first-fit order (column by column, rows ascending), in one pass:
+ * RBs stacked in a column first, then runs that continue the open rectangle
+ * starting on the same row.  Used for big requests.
+ */
+static void build_unions_cm(int k, int s) {
     int i, h = shH[s], w = shW[s];
     nUn = 0;
     unCur++;
@@ -995,8 +923,9 @@ static void build_unions_cm(int k, int s)
     }
 }
 
-static void build_unions(int k, int s)
-{
+/* merge the k RBs of one shape into rectangles: runs along time in each row
+   band first, then equal runs in adjacent row bands */
+static void build_unions(int k, int s) {
     int i, j, m, h = shH[s];
     RB t;
     for (i = 0; i < k; i++) tmpUn[i] = tmpRB[i];
@@ -1026,25 +955,53 @@ static void build_unions(int k, int s)
     }
 }
 
+/* ---------- placing one user ---------- */
+
 /*
- * Try to place all RBs of option oi using a single shape for the whole
- * request (always satisfies the numerology rule, whatever "overlap" means).
- * The first RB picks the best shape among `allowed`; the rest are locked to
- * it.  Returns 1 on success (grid keeps the RBs), 0 if even the first RB
- * cannot be placed, 2 if a later RB failed (*used = the locked shape).
+ * Two shapes in turn: the first j RBs of shape sa (its first fit, columns up
+ * to e), then the other k - j RBs of another shape in columns after e, by
+ * first fit.  RBs of different shapes never overlap in time, so the
+ * numerology rule holds.  j is the most RBs sa holds, then one fewer.
  */
-static int try_option_shapes(User *u, int oi, unsigned allowed, int *used)
-{
+static RB *mixA;                    /* first-fit RBs of the first shape */
+
+static int try_mixed(User *u, int oi, unsigned allowed, int sa, int ca, int k) {
     const u64 *good = u->optMask + (size_t)oi * W;
-    int k = u->optK[oi], a = u->arr, d = u->dl, j, s, placed = 0;
-    long long need = (long long)k * S, freeCells;
-    /* upper bound on free cells: whole 64-column blocks overlapping the window */
-    {
-        int b0 = a >> 6, b1 = d >> 6;
-        long long cols = (long long)(b1 - b0 + 1) * 64;
-        if (((long long)b1 << 6) + 63 > X - 1) cols -= ((long long)b1 << 6) + 63 - (X - 1);
-        freeCells = cols * Y - (fen_pref(b1 + 1) - fen_pref(b0));
+    int a = u->arr, d = u->dl, j, sb, ex, i;
+    if (dry_count(sa, good, a, d, ca, &ex) < ca || !ex) return 0;
+    memcpy(mixA, dryRB, sizeof(RB) * (size_t)ca);
+    for (j = ca; j >= 1 && j >= ca - 1; j--) {
+        long long e = (long long)mixA[j - 1].x + shW[sa] - 1;   /* columns are in order */
+        for (sb = 0; sb < nsh; sb++) {
+            if (sb == sa || !((allowed >> sb) & 1U) || e + shW[sb] > d) continue;
+            if (dry_count(sb, good, (int)e + 1, d, k - j, &ex) < k - j || !ex) continue;
+            memcpy(tmpRB, mixA, sizeof(RB) * (size_t)j);
+            memcpy(tmpRB + j, dryRB, sizeof(RB) * (size_t)(k - j));
+            for (i = 0; i < k; i++) {
+                tmpJ[i] = jLen;
+                markOnly = -1;
+                mark_rb(&tmpRB[i], 1);
+            }
+            return 1;
+        }
     }
+    return 0;
+}
+
+/*
+ * Try to place all RBs of option oi with one shape for the whole request (two
+ * time-disjoint shapes only as a fallback).  The first RB picks the best shape
+ * among `allowed`; the rest are locked to it.  Returns 1 on success (grid keeps
+ * the RBs), 0 if even the first RB cannot be placed, 2 if a later RB failed
+ * (*used = the locked shape).
+ */
+static int try_option_shapes(User *u, int oi, unsigned allowed, int *used) {
+    const u64 *good = u->optMask + (size_t)oi * W;
+    int k = u->optK[oi], a = u->arr, d = u->dl, j, s, placed = 0, b0 = a >> 6, b1 = d >> 6;
+    long long need = (long long)k * S, freeCells, cols = (long long)(b1 - b0 + 1) * 64;
+    /* upper bound on free cells: whole 64-column blocks overlapping the window */
+    if (((long long)b1 << 6) + 63 > X - 1) cols -= ((long long)b1 << 6) + 63 - (X - 1);
+    freeCells = cols * Y - (fen_pref(b1 + 1) - fen_pref(b0));
 
     ops += 12 * ilog2(X + 1) + 24;
     if (freeCells < need) return 0;
@@ -1052,16 +1009,12 @@ static int try_option_shapes(User *u, int oi, unsigned allowed, int *used)
         /* first fit without contact scoring (dry runs only): the first shape,
            in index order, that holds all k RBs */
         int ex, c, i, bs = -1;
-#ifdef LEAN_STATS
-        leanTry++;
-#endif
         for (s = 0; s < nsh; s++) {
             if (!((allowed >> s) & 1U)) continue;
             if ((shDirty >> s) & 1U) continue;   /* rarely used by this mode: not kept */
             c = dry_count(s, good, a, d, k, &ex);
             if (c >= k && ex) { bs = s; break; }
         }
-#ifndef NO_STALE_TRY
         /* the shapes not kept up to date: rebuild their masks over this window
            first, while that stays a small share of the cheap mode's work */
         for (s = 0; bs < 0 && s < nsh && staleWork * STALE_DIV < leanWork; s++) {
@@ -1072,7 +1025,6 @@ static int try_option_shapes(User *u, int oi, unsigned allowed, int *used)
             staleWork += ops - o1;
             if (c >= k && ex) bs = s;
         }
-#endif
         if (bs < 0) return 0;
         s = bs;
         leanUse[s]++; leanUseTot++;
@@ -1100,24 +1052,30 @@ static int try_option_shapes(User *u, int oi, unsigned allowed, int *used)
             mark_rb(&tmpUn[i], 1);
         }
         ops += (long long)(k - nUn) * UNION_RB_COST;   /* merged RBs still cost time */
-#ifdef LEAN_STATS
-        leanMerged += k - nUn; leanRB += k;
-#endif
         unionPlaced = k;
         *used = s;
         return 1;
     }
-#ifndef DRY_FILTER
-#define DRY_FILTER 1
-#endif
-    if (DRY_FILTER && k > 1) {
+    if (k > 1) {
         /* shapes whose first fit (dry run, nothing marked) cannot hold all k
            RBs are left out: a failed placement costs far more than this test */
         unsigned keep = 0;
-        int ex;
-        for (s = 0; s < nsh; s++)
-            if (((allowed >> s) & 1U) && dry_count(s, good, a, d, k, &ex) >= k) keep |= 1U << s;
-        if (!keep) return 0;
+        int ex, c, bestC = 0, bestS = -1;
+        for (s = 0; s < nsh; s++) {
+            if (!((allowed >> s) & 1U)) continue;
+            c = dry_count(s, good, a, d, k, &ex);
+            if (c >= k) keep |= 1U << s;
+            else if (ex && c > bestC) { bestC = c; bestS = s; }
+        }
+        if (!keep) {
+            /* no single shape holds all k RBs: two shapes in turn, if the best
+               one is at most one RB short */
+            if (bestS >= 0 && bestC >= k - 1 && try_mixed(u, oi, allowed, bestS, bestC, k)) {
+                *used = -1;
+                return 1;
+            }
+            return 0;
+        }
         allowed = keep;
     }
     for (s = 0; s < nsh; s++) scanFrom[s] = a;
@@ -1143,8 +1101,7 @@ static int try_option_shapes(User *u, int oi, unsigned allowed, int *used)
     return 1;
 }
 
-static int try_option(User *u, int oi)
-{
+static int try_option(User *u, int oi) {
     unsigned allowed = u->optShapes[oi];
     while (allowed) {
         int used = -1, r = try_option_shapes(u, oi, allowed, &used);
@@ -1159,8 +1116,7 @@ static int try_option(User *u, int oi)
  * Can at least one RB of option oi be placed anywhere in the window?
  * (stops at the first valid column; no scoring)
  */
-static int probe_option(const User *u, int oi)
-{
+static int probe_option(const User *u, int oi) {
     const u64 *good = u->optMask + (size_t)oi * W;
     int s, i, x, a = u->arr, d = u->dl;
     for (s = 0; s < nsh; s++) {
@@ -1193,30 +1149,19 @@ static int probe_option(const User *u, int oi)
     return 0;
 }
 
-static int place_user_j(User *u);
 static int bigPhase;            /* 1: only the options with more than MAX_RB RBs */
 static int *bigIdx, nBig;       /* requests with such options, best profit per area first */
 static double *bigKeyV;         /* their profit per area (descending) */
 typedef struct { double key; int id; } BigKey;
-static int cmp_bigkey(const void *p, const void *q)
-{
+
+static int cmp_bigkey(const void *p, const void *q) {
     const BigKey *a = (const BigKey *)p, *b = (const BigKey *)q;
     if (a->key != b->key) return a->key > b->key ? -1 : 1;
     return (a->id > b->id) - (a->id < b->id);
 }
 
-static int place_user(User *u)
-{
-    int r;
-    jLen = 0; jOk = jCap > 0; jOn = jOk;
-    r = place_user_j(u);
-    jOn = 0; jLen = 0; markOnly = -1;
-    return r;
-}
-
 /* the request fits: bring the other shapes' masks up to date for its RBs */
-static void apply_deferred(int k)
-{
+static void apply_deferred(int k) {
     long long span = 0;
     int s2, r2, locked = tmpRB[0].s;
     const RB *rr = unionPlaced ? tmpUn : tmpRB;
@@ -1232,8 +1177,8 @@ static void apply_deferred(int k)
     ops += span * (W == 1 ? 5 : 2 * W + 3);
 }
 
-static int place_user_j(User *u)
-{
+/* first option (fewest RBs) that fits; returns 1 if the user is served */
+static int place_user_j(User *u) {
     int oi, o0 = bigPhase ? u->nopt : 0, o1 = bigPhase ? u->nopt + u->nbig : u->nopt;
     ops += USER_COST;                   /* per-request overhead (cache misses on its data) */
     curOwner = (int)(u - U);
@@ -1279,8 +1224,16 @@ static int place_user_j(User *u)
     return 0;
 }
 
-static void unassign(User *u)
-{
+/* place one user (journal on: a failed attempt is undone cheaply) */
+static int place_user(User *u) {
+    int r;
+    jLen = 0; jOk = jCap > 0; jOn = jOk;
+    r = place_user_j(u);
+    jOn = 0; jLen = 0; markOnly = -1;
+    return r;
+}
+
+static void unassign(User *u) {
     int i;
     for (i = 0; i < u->nrb; i++) mark_rb(&u->rbs[i], 0);
     u->assigned = 0;
@@ -1296,8 +1249,7 @@ static void unassign(User *u)
 static long long *spanLo, *spanHi;
 static size_t spanCap;
 
-static void unassign_batch(const int *ids, int n)
-{
+static void unassign_batch(const int *ids, int n) {
     size_t ns = 0, a, m;
     int i, r, s;
     for (i = 0; i < n; i++) ns += (size_t)U[ids[i]].nrb;
@@ -1337,8 +1289,107 @@ static void unassign_batch(const int *ids, int n)
     }
 }
 
-/* ---------- options ---------- */
+/* ---------- grid maintenance ---------- */
 
+/*
+ * Masks of shape s for start columns lo..hi, recomputed from the occupancy
+ * (in pieces that fit the scratch buffers).
+ */
+static void refresh_shape(int s, long long lo, long long hi) {
+    long long step = 2LL * maxShW + 64, x;
+    int j0 = jOn;
+    if (lo < 0) lo = 0;
+    if (hi > (long long)X - shW[s]) hi = (long long)X - shW[s];
+    jOn = 0;                            /* never undone */
+    for (x = lo; x <= hi; x += step) fz_update(s, x, x + step - 1 > hi ? hi : x + step - 1);
+    jOn = j0;
+}
+
+/* bring every stale mask up to date (before anything but the cheap mode reads them) */
+static void refresh_dirty(void) {
+    int s;
+    for (s = 0; s < nsh; s++)
+        if ((shDirty >> s) & 1U) refresh_shape(s, 0, (long long)X - 1);
+    shDirty = 0;
+}
+
+/* shapes the cheap mode keeps up to date: those it used for at least 2% of its
+   placements in this pass (all of them until it has placed 1/16 of the requests:
+   the leading requests are the most valuable ones) */
+static void update_lean_keep(int nAss) {
+    unsigned keep = 0;
+    int s;
+    if (leanUseTot < 256 || leanUseTot < nAss / 16) return;
+    for (s = 0; s < nsh; s++)
+        if (leanUse[s] * 50 >= leanUseTot) keep |= 1U << s;
+    for (s = 0; s < nsh; s++)
+        if (((keep & shDirty) >> s) & 1U) {   /* needed again: rebuild it */
+            refresh_shape(s, 0, (long long)X - 1);
+            shDirty &= ~(1U << s);
+        }
+    leanKeep = keep;
+}
+
+/* empty grid, nobody served */
+static void clear_all(void) {
+    int i;
+    for (i = 0; i < N; i++) U[i].assigned = 0;
+    shDirty = 0;
+    memset(col, 0, sizeof(u64) * (size_t)X * W);
+    memset(fen, 0, sizeof(long long) * ((size_t)nBlk + 1));
+    if (useRow) memset(rowOcc, 0, sizeof(u64) * (size_t)Y * fzWords);
+    if (useOwn && ownLive) { size_t c2, nc2 = (size_t)X * Y; for (c2 = 0; c2 < nc2; c2++) own[c2] = -1; }
+    ops += (long long)X * W * 2 + (long long)N;
+    for (i = 0; i < nsh; i++) {
+        int x, c, xm = X - shW[i];          /* starts 0..xm are free on an empty grid */
+        u64 *F = fm[i];
+        if (!((usedSh >> i) & 1U)) continue;
+        ops += (long long)X * W;
+        memset(fz[i], 0, sizeof(u64) * (size_t)fzWords);
+        runs(scMm, scAll, shH[i]);
+        if (W == 1) {
+            u64 v = scMm[0];
+            for (x = 0; x <= xm; x++) F[x] = v;
+            for (; x <= X; x++) F[x] = 0;
+        } else {
+            for (x = 0; x <= xm; x++)
+                for (c = 0; c < W; c++) F[(size_t)x * W + c] = scMm[c];
+            memset(F + (size_t)(xm + 1) * W, 0, sizeof(u64) * (size_t)(X - xm) * W);
+        }
+        for (x = 0; x + 63 <= xm; x += 64) fz[i][x >> 6] = ~0ULL;
+        for (; x <= xm; x++) fz[i][x >> 6] |= 1ULL << (x & 63);
+        memset(fzs[i], 0, sizeof(u64) * (size_t)fzsWords);
+        fzs_fix(i, 0, fzWords - 1);
+    }
+    curProfit = 0; curArea = 0;
+}
+
+/* owner grid from the users' RBs */
+static void rebuild_owner(void) {
+    size_t c2, nc2 = (size_t)X * Y;
+    int i, r, c, yy;
+    for (c2 = 0; c2 < nc2; c2++) own[c2] = -1;
+    for (i = 0; i < N; i++) {
+        const User *u = &U[i];
+        if (!u->assigned) continue;
+        for (r = 0; r < u->nrb; r++) {
+            const RB *rb = &u->rbs[r];
+            for (c = rb->x; c < rb->x + rb->w; c++) {
+                int *o = own + (size_t)c * Y + rb->y;
+                for (yy = 0; yy < rb->h; yy++) o[yy] = i;
+            }
+        }
+    }
+    ops += (long long)(nc2 / 4) + (long long)N;
+}
+
+/* ---------- options of a user ---------- */
+
+/*
+ * Option = (usable rows, k): for a bit threshold b, the rows with bits >= b
+ * and k = ceil(ceil(D / S) / b) RBs.  Thresholds are swept from high to low
+ * (rows and k only grow); for equal k only the widest row set is kept.
+ */
 static const long long *curBits;
 static int *scIdx;
 static int *tK;
@@ -1346,16 +1397,14 @@ static u64 *tMask;
 static unsigned *tSh;
 static u64 *sortA, *sortB;      /* scratch for sorting rows */
 
-static int cmp_bits_desc(const void *p, const void *q)
-{
+static int cmp_bits_desc(const void *p, const void *q) {
     long long a = curBits[*(const int *)p], b = curBits[*(const int *)q];
     if (a != b) return a > b ? -1 : 1;
     return *(const int *)p - *(const int *)q;
 }
 
 /* longest run of ones in one word */
-static int run_len64(u64 v)
-{
+static int run_len64(u64 v) {
     u64 r[7], cur = ~0ULL;
     int j, len = 0;
     if (!v) return 0;
@@ -1371,8 +1420,7 @@ static int run_len64(u64 v)
 }
 
 /* shapes that fit: h <= longest run of usable rows, w <= window length */
-static unsigned shapes_fit(const u64 *g, int L)
-{
+static unsigned shapes_fit(const u64 *g, int L) {
     unsigned sm = 0;
     int s, i, carry = 0, best = 0;
     for (i = 0; i < W; i++) {
@@ -1394,8 +1442,7 @@ static unsigned shapes_fit(const u64 *g, int L)
 }
 
 /* store an option into slot o of the temporary arrays */
-static void keep_option(int o, int k, const u64 *g, unsigned sm)
-{
+static void keep_option(int o, int k, const u64 *g, unsigned sm) {
     tK[o] = k;
     memcpy(tMask + (size_t)o * W, g, sizeof(u64) * (size_t)W);
     tSh[o] = sm;
@@ -1405,8 +1452,7 @@ static void keep_option(int o, int k, const u64 *g, unsigned sm)
 static char *arenaCur;
 static size_t arenaLeft;
 
-static void *arena_alloc(size_t n)
-{
+static void *arena_alloc(size_t n) {
     void *p;
     n = (n + 7) & ~(size_t)7;
     if (n > arenaLeft) {
@@ -1422,8 +1468,7 @@ static void *arena_alloc(size_t n)
 }
 
 /* store the kept options of one user (nkeep > 0) */
-static void store_options(User *u, int nkeep, int nbig)
-{
+static void store_options(User *u, int nkeep, int nbig) {
     int nt = nkeep + nbig;
     char *mem = (char *)arena_alloc((sizeof(int) + sizeof(unsigned)) * (size_t)nt + 8 + sizeof(u64) * (size_t)nt * W);
     if (!mem) return;
@@ -1439,8 +1484,7 @@ static void store_options(User *u, int nkeep, int nbig)
 }
 
 /* shapes that fit rows v (one word) and window length L */
-static unsigned shapes_fit1(u64 v, int L)
-{
+static unsigned shapes_fit1(u64 v, int L) {
     unsigned sm = 0;
     int s, best = run_len64(v);
     for (s = 0; s < nsh; s++)
@@ -1455,10 +1499,10 @@ static unsigned shapes_fit1(u64 v, int L)
  */
 static u64 valRows[64];         /* rows per small bit value (kept all-zero between calls) */
 
-static int build_options1(User *u, const long long *bits, int L)
-{
+static int build_options1(User *u, const long long *bits, int L) {
     u64 key[64], g = 0, pendM = 0, tailM = 0, present = 0, bigM1 = 0, bigM2 = 0;
-    int n = 0, y, a2, p, nkeep = 0, pend = 0, tailValid = 0, small = 1, nb = 0;
+    int n = 0, y, a2, p, nkeep = 0, pend = 0, tailValid = 0, small = 1, nb = 0, nbk = 0;
+    unsigned sm;
     long long q, pendK = 0, tailK = 0, bigK1 = 0, bigK2 = 0;
     for (y = 0; y < Y; y++) {
         long long b = bits[y];
@@ -1470,24 +1514,22 @@ static int build_options1(User *u, const long long *bits, int L)
     if (!n) return 1;
     if (small) {
         /* bucket by value: only the groups matter, not the order inside them */
+        int vals[64], nv = 0;
         for (a2 = 0; a2 < n; a2++) {
             int b = (int)(key[a2] >> 6);
             valRows[b] |= 1ULL << (63 - (int)(key[a2] & 63));
             present |= 1ULL << b;
         }
-        {
-            int vals[64], nv = 0;
-            while (present) { vals[nv++] = ctz64(present); present &= present - 1; }
-            n = 0;
-            while (nv > 0) {                            /* highest value first */
-                int b = vals[--nv];
-                u64 r = valRows[b];
-                valRows[b] = 0;
-                while (r) {
-                    int t = ctz64(r);
-                    r &= r - 1;
-                    key[n++] = ((u64)b << 6) | (u64)(63 - t);
-                }
+        while (present) { vals[nv++] = ctz64(present); present &= present - 1; }
+        n = 0;
+        while (nv > 0) {                                /* highest value first */
+            int b = vals[--nv];
+            u64 r = valRows[b];
+            valRows[b] = 0;
+            while (r) {
+                int t = ctz64(r);
+                r &= r - 1;
+                key[n++] = ((u64)b << 6) | (u64)(63 - t);
             }
         }
     } else {
@@ -1527,7 +1569,7 @@ static int build_options1(User *u, const long long *bits, int L)
         }
         if (pend && k != pendK) {
             if (nkeep < maxOpt - 1) {
-                unsigned sm = shapes_fit1(pendM, L);
+                sm = shapes_fit1(pendM, L);
                 if (sm) { tK[nkeep] = (int)pendK; tMask[nkeep] = pendM; tSh[nkeep] = sm; nkeep++; }
             } else {
                 tailValid = 1;
@@ -1541,22 +1583,18 @@ static int build_options1(User *u, const long long *bits, int L)
         pendM = g;
     }
     if (tailValid) {
-        unsigned sm = shapes_fit1(tailM, L);
+        sm = shapes_fit1(tailM, L);
         if (sm && (nkeep == 0 || tailK > tK[nkeep - 1])) { tK[nkeep] = (int)tailK; tMask[nkeep] = tailM; tSh[nkeep] = sm; nkeep++; }
     }
-    {
-        int nbk = 0;
-        unsigned sm;
-        if (nb >= 1 && (sm = shapes_fit1(bigM1, L)) != 0) { tK[nkeep] = (int)bigK1; tMask[nkeep] = bigM1; tSh[nkeep] = sm; nbk++; }
-        if (nb >= 2 && (sm = shapes_fit1(bigM2, L)) != 0) { tK[nkeep + nbk] = (int)bigK2; tMask[nkeep + nbk] = bigM2; tSh[nkeep + nbk] = sm; nbk++; }
-        if (nkeep || nbk) store_options(u, nkeep, nbk);
-    }
+    if (nb >= 1 && (sm = shapes_fit1(bigM1, L)) != 0) { tK[nkeep] = (int)bigK1; tMask[nkeep] = bigM1; tSh[nkeep] = sm; nbk++; }
+    if (nb >= 2 && (sm = shapes_fit1(bigM2, L)) != 0) { tK[nkeep + nbk] = (int)bigK2; tMask[nkeep + nbk] = bigM2; tSh[nkeep + nbk] = sm; nbk++; }
+    if (nkeep || nbk) store_options(u, nkeep, nbk);
     return 1;
 }
 
-static void build_options(User *u, const long long *bits)
-{
-    int L, cnt = 0, p, y, nkeep = 0, pend = 0, tailValid = 0, i, nb = 0;
+static void build_options(User *u, const long long *bits) {
+    int L, cnt = 0, p, y, nkeep = 0, pend = 0, tailValid = 0, i, nb = 0, nbk = 0;
+    unsigned sm;
     long long q, pendK = 0, tailK = 0, bigK1 = 0, bigK2 = 0;
 
     u->nopt = 0;
@@ -1632,7 +1670,7 @@ static void build_options(User *u, const long long *bits)
         if (pend && k != pendK) {
             /* finalise the previous group: the largest row set for its k */
             if (nkeep < maxOpt - 1) {
-                unsigned sm = shapes_fit(scPend, L);
+                sm = shapes_fit(scPend, L);
                 if (sm) keep_option(nkeep++, (int)pendK, scPend, sm);
             } else {
                 tailValid = 1;          /* candidate for the last slot */
@@ -1646,27 +1684,24 @@ static void build_options(User *u, const long long *bits)
         memcpy(scPend, scG, sizeof(u64) * (size_t)W);
     }
     if (tailValid) {
-        unsigned sm = shapes_fit(scTail, L);
+        sm = shapes_fit(scTail, L);
         if (sm && (nkeep == 0 || tailK > tK[nkeep - 1])) keep_option(nkeep++, (int)tailK, scTail, sm);
     }
-    {
-        int nbk = 0;
-        unsigned sm;
-        if (nb >= 1 && (sm = shapes_fit(scBig1, L)) != 0) keep_option(nkeep + nbk++, (int)bigK1, scBig1, sm);
-        if (nb >= 2 && (sm = shapes_fit(scBig2, L)) != 0) keep_option(nkeep + nbk++, (int)bigK2, scBig2, sm);
-        if (!nkeep && !nbk) return;
-        store_options(u, nkeep, nbk);
-    }
+    if (nb >= 1 && (sm = shapes_fit(scBig1, L)) != 0) keep_option(nkeep + nbk++, (int)bigK1, scBig1, sm);
+    if (nb >= 2 && (sm = shapes_fit(scBig2, L)) != 0) keep_option(nkeep + nbk++, (int)bigK2, scBig2, sm);
+    if (!nkeep && !nbk) return;
+    store_options(u, nkeep, nbk);
 }
 
-/* ---------- priorities ---------- */
+/* ---------- priority orders ---------- */
 
+/* key of order v: profit / minArea^alpha (0-4), density favouring tight
+   windows (5), earliest deadline (6), earliest arrival (7), profit (8) */
 static const double alphaV[NVAR] = {1.0, 0.8, 1.25, 0.6, 1.6, 1.0, 1.0, 1.0, 1.0};
 #define NVAR_LNS 6                  /* orders 6..8 are construction-only */
 
 /* natural log for x > 0, without libm */
-static double my_log(double x)
-{
+static double my_log(double x) {
     double k = 0.0, t, t2, sum = 0.0, term;
     int n;
     while (x > 2.0) { x *= 0.5; k += 1.0; }
@@ -1679,8 +1714,7 @@ static double my_log(double x)
 }
 
 /* e^x without libm */
-static double my_exp(double x)
-{
+static double my_exp(double x) {
     double r = 1.0, term = 1.0;
     int n, k = 0;
     while (x > 0.5) { x *= 0.5; k++; }
@@ -1690,8 +1724,7 @@ static double my_exp(double x)
     return r;
 }
 
-static double user_key(const User *u, int v)
-{
+static double user_key(const User *u, int v) {
     double base;
     if (u->nopt <= 0 || u->minArea <= 0) return -1.0;   /* never assignable */
     if (alphaV[v] == 1.0) base = (double)u->profit / (double)u->minArea;
@@ -1706,28 +1739,14 @@ static double user_key(const User *u, int v)
     return base;
 }
 
-#if 0
-static int cmp_order(const void *p, const void *q)
-{
-    int a = *(const int *)p, b = *(const int *)q;
-    double ka = keyBuf[a], kb = keyBuf[b];
-    if (ka > kb) return -1;
-    if (ka < kb) return 1;
-    if (U[a].dl != U[b].dl) return U[a].dl < U[b].dl ? -1 : 1;
-    return (a > b) - (a < b);
-}
-#endif
-
 /*
- * Same order as cmp_order (key descending, then deadline ascending, then index
- * ascending), computed with stable LSD radix sorts instead of qsort: sequential
- * passes are far cheaper than a comparator chasing scattered memory.
+ * Users by key descending, then deadline ascending, then index ascending,
+ * with stable LSD radix sorts (much faster than qsort on scattered data).
  */
 typedef struct { u64 k; int id; } KeyId;
 static KeyId *rsA, *rsB;
 
-static void radix_pass(KeyId *src, KeyId *dst, int n, int shift)
-{
+static void radix_pass(KeyId *src, KeyId *dst, int n, int shift) {
     int cnt[257], i;
     memset(cnt, 0, sizeof(cnt));
     for (i = 0; i < n; i++) cnt[((src[i].k >> shift) & 255) + 1]++;
@@ -1735,16 +1754,15 @@ static void radix_pass(KeyId *src, KeyId *dst, int n, int shift)
     for (i = 0; i < n; i++) dst[cnt[(src[i].k >> shift) & 255]++] = src[i];
 }
 
-static u64 desc_bits(double d)          /* larger double -> smaller key */
-{
+/* larger double -> smaller key */
+static u64 desc_bits(double d) {
     u64 b;
     memcpy(&b, &d, sizeof(b));
     b = (b >> 63) ? ~b : (b | 0x8000000000000000ULL);   /* ascending-sortable */
     return ~b;
 }
 
-static void radix_order(int *out)
-{
+static void radix_order(int *out) {
     int i, p;
     KeyId *a = rsA, *b = rsB, *t;
     for (i = 0; i < N; i++) { a[i].k = (u64)((long long)U[i].dl + 2147483648LL); a[i].id = i; }
@@ -1752,6 +1770,479 @@ static void radix_order(int *out)
     for (i = 0; i < N; i++) a[i].k = desc_bits(keyBuf[a[i].id]);
     for (p = 0; p < 64; p += 8) { radix_pass(a, b, N, p); t = a; a = b; b = t; }
     for (i = 0; i < N; i++) out[i] = a[i].id;
+}
+
+/* ---------- time-axis compression ---------- */
+
+/*
+ * Only columns inside some request's window can ever hold an RB, so the time
+ * axis is rebuilt from the merged windows ("segments") with one free column
+ * between segments (and before / after them where the original had room).
+ * Contacts and every rule are unchanged by this.  If even that is too long
+ * for memory, windows are cut to their first `cap` columns (cap >= widest shape).
+ */
+static int nSeg, *segC, *segL;
+static long long *segO;          /* original start of each segment */
+static long long Xorig;
+static int *cmpIdx;
+static long long *oA, *oD;       /* original windows when X does not fit an int */
+
+static long long win_a(int i) { return oA ? oA[i] : U[i].arr; }
+static long long win_d(int i) { return oA ? oD[i] : U[i].dl; }
+
+static int cmp_arr_idx(const void *p, const void *q) {
+    int a = *(const int *)p, b = *(const int *)q;
+    if (win_a(a) != win_a(b)) return win_a(a) < win_a(b) ? -1 : 1;
+    return (a > b) - (a < b);
+}
+
+/* compressed length for a window cap; fills the segment arrays if build */
+static long long comp_len(int nIdx, long long cap, int build) {
+    long long tot = 0, cs = -1, ce = -2;
+    int i, ns = 0;
+    for (i = 0; i < nIdx; i++) {
+        long long a = win_a(cmpIdx[i]), e = win_d(cmpIdx[i]);
+        if (e - a + 1 > cap) e = a + cap - 1;
+        if (a > ce + 1) {
+            if (ce >= cs && cs >= 0) {
+                if (build) { segO[ns] = cs; segL[ns] = (int)(ce - cs + 1); }
+                ns++; tot += ce - cs + 1;
+            }
+            cs = a; ce = e;
+        } else if (e > ce) ce = e;
+    }
+    if (cs >= 0) {
+        if (build) { segO[ns] = cs; segL[ns] = (int)(ce - cs + 1); }
+        ns++; tot += ce - cs + 1;
+    }
+    if (build) nSeg = ns;
+    if (ns == 0) return 1;
+    if (build) {
+        /* gaps: one separator before the first / after the last segment if room */
+        int k;
+        segC[0] = segO[0] > 0 ? 1 : 0;
+        for (k = 1; k < ns; k++) segC[k] = segC[k - 1] + segL[k - 1] + 1;
+        return (long long)segC[ns - 1] + segL[ns - 1] +
+               (segO[ns - 1] + segL[ns - 1] < Xorig ? 1 : 0);
+    }
+    return tot + (long long)(ns - 1) + 2;
+}
+
+/* monotone map of an original column into the compressed axis */
+static int comp_map(long long x) {
+    int lo = 0, hi = nSeg - 1, k = -1;
+    while (lo <= hi) {
+        int md = (lo + hi) / 2;
+        if (segO[md] <= x) { k = md; lo = md + 1; } else hi = md - 1;
+    }
+    if (k < 0) return 0;
+    if (x < segO[k] + segL[k]) return segC[k] + (int)(x - segO[k]);
+    return segC[k] + segL[k];                       /* separator after segment k */
+}
+
+/* original column of a compressed column inside a segment */
+static long long comp_unmap(int x) {
+    int lo = 0, hi = nSeg - 1, k = 0;
+    if (!nSeg) return x;
+    while (lo <= hi) {
+        int md = (lo + hi) / 2;
+        if (segC[md] <= x) { k = md; lo = md + 1; } else hi = md - 1;
+    }
+    return segO[k] + (x - segC[k]);
+}
+
+/* windows that cannot be represented: serve nobody rather than misplace */
+static void comp_fail(void) {
+    int i;
+    if (!oA) return;
+    for (i = 0; i < N; i++) U[i].nopt = U[i].nbig = 0;
+    free(oA); free(oD); oA = oD = 0;
+    X = 1;
+}
+
+/*
+ * Even windows cut to the widest shape do not fit in memory (very wide
+ * shapes): keep the requests with the best profit per area while their
+ * windows fit; the others cannot be served.  Returns the new count of
+ * cmpIdx (still in arrival order).
+ */
+static double *keepKey;
+
+static int cmp_keep(const void *p, const void *q) {
+    int a = *(const int *)p, b = *(const int *)q;
+    if (keepKey[a] != keepKey[b]) return keepKey[a] > keepKey[b] ? -1 : 1;
+    return (a > b) - (a < b);
+}
+
+static int comp_keep_best(int nIdx, long long cap, long long xlim) {
+    int *byKey = (int *)malloc(sizeof(int) * ((size_t)nIdx + 1)), i, n2 = 0;
+    char *keep = (char *)calloc((size_t)N + 1, 1);
+    long long tot = 0;
+    keepKey = (double *)malloc(sizeof(double) * ((size_t)N + 1));
+    if (!byKey || !keep || !keepKey) {          /* no memory: serve nobody */
+        for (i = 0; i < nIdx; i++) U[cmpIdx[i]].nopt = U[cmpIdx[i]].nbig = 0;
+        free(byKey); free(keep); free(keepKey); keepKey = 0;
+        return 0;
+    }
+    for (i = 0; i < nIdx; i++) {
+        const User *u = &U[cmpIdx[i]];
+        long long area = u->nopt > 0 ? u->minArea : (long long)u->optK[u->nopt] * S;
+        keepKey[cmpIdx[i]] = (double)u->profit / (double)(area > 0 ? area : 1);
+        byKey[i] = cmpIdx[i];
+    }
+    qsort(byKey, (size_t)nIdx, sizeof(int), cmp_keep);
+    for (i = 0; i < nIdx; i++) {
+        long long len = win_d(byKey[i]) - win_a(byKey[i]) + 1;
+        if (len > cap) len = cap;
+        if (tot + len + 1 > xlim) break;
+        tot += len + 1;
+        keep[byKey[i]] = 1;
+    }
+    for (i = 0; i < nIdx; i++) {
+        int id = cmpIdx[i];
+        if (keep[id]) cmpIdx[n2++] = id;
+        else U[id].nopt = U[id].nbig = 0;
+    }
+    free(byKey); free(keep); free(keepKey); keepKey = 0;
+    ops += (long long)nIdx * 40;
+    return n2;
+}
+
+static void compress_time(void) {
+    int i, nIdx = 0, sorted = 1, maxW2 = 1, nUsed = 0;
+    long long full, cap, xlim, newX;
+    unsigned used = 0;
+    if (!oA) Xorig = X;
+    for (i = 0; i < nsh; i++) if (shW[i] > maxW2) maxW2 = shW[i];
+    for (i = 0; i < N; i++) {
+        int o2;
+        for (o2 = 0; o2 < U[i].nopt + U[i].nbig; o2++) used |= U[i].optShapes[o2];
+    }
+    for (i = 0; i < nsh; i++) if ((used >> i) & 1U) nUsed++;
+    /* columns the grid may have: memory for the occupancy and the free-start masks */
+    xlim = (long long)(MEM_GRID / ((double)(1 + nUsed) * W * 8.0)) - 4;
+    if (xlim > MAX_COLS) xlim = MAX_COLS;
+    cmpIdx = (int *)malloc(sizeof(int) * ((size_t)N + 1));
+    if (!cmpIdx) { comp_fail(); return; }
+    for (i = 0; i < N; i++) if (U[i].nopt + U[i].nbig > 0 && win_a(i) <= win_d(i)) cmpIdx[nIdx++] = i;
+    for (i = 1; i < nIdx; i++) if (win_a(cmpIdx[i]) < win_a(cmpIdx[i - 1])) sorted = 0;
+    if (!sorted) qsort(cmpIdx, (size_t)nIdx, sizeof(int), cmp_arr_idx);
+    full = comp_len(nIdx, Xorig + 1, 0);
+    cap = Xorig + 1;
+    if (full > xlim) {
+        long long lo = maxW2, hi = Xorig;       /* largest cap that fits */
+        while (lo < hi) {
+            long long md = lo + (hi - lo + 1) / 2;
+            if (comp_len(nIdx, md, 0) <= xlim) lo = md; else hi = md - 1;
+        }
+        cap = lo;
+        if (comp_len(nIdx, cap, 0) > xlim) nIdx = comp_keep_best(nIdx, cap, xlim);
+    } else if (!oA && full * 2 > X) {           /* little to gain: keep the axis */
+        free(cmpIdx); cmpIdx = 0;
+        return;
+    }
+    segO = (long long *)malloc(sizeof(long long) * ((size_t)nIdx + 1));
+    segC = (int *)malloc(sizeof(int) * ((size_t)nIdx + 1));
+    segL = (int *)malloc(sizeof(int) * ((size_t)nIdx + 1));
+    if (!segO || !segC || !segL) {
+        free(segO); free(segC); free(segL); segO = 0; segC = segL = 0; free(cmpIdx); cmpIdx = 0;
+        comp_fail();
+        return;
+    }
+    newX = comp_len(nIdx, cap, 1);
+    for (i = 0; i < N; i++) {
+        User *u = &U[i];
+        long long a = win_a(i), e = win_d(i);
+        if (u->nopt + u->nbig > 0 && a <= e && e - a + 1 > cap) e = a + cap - 1;
+        u->arr = comp_map(a);
+        u->dl = comp_map(e);
+    }
+    free(oA); free(oD); oA = oD = 0;
+    X = (int)(newX < 1 ? 1 : newX);
+    free(cmpIdx); cmpIdx = 0;
+    ops += (long long)N * 40;
+}
+
+/* ---------- shapes ---------- */
+
+/* every h*w = S that fits the grid, by height; shift steps of runs() per height */
+static void build_shapes(void) {
+    int hs[MAXSH * 4], nh = 0, i, mw = 1;
+    long long d;
+    nsh = 0;
+    if (S <= 0) return;
+    for (d = 1; d * d <= S; d++) {
+        if (S % d) continue;
+        if (nh < MAXSH * 4) hs[nh++] = (int)d;
+        if (d * d != S && nh < MAXSH * 4) hs[nh++] = (int)(S / d);
+    }
+    qsort(hs, (size_t)nh, sizeof(int), cmp_int);
+    for (i = 0; i < nh && nsh < MAXSH; i++) {
+        int h = hs[i], w = S / h;
+        if (h > Y || w > X) continue;
+        shH[nsh] = h; shW[nsh] = w; nsh++;
+    }
+    /* fixed charge per marking, grows with the widest shape */
+    for (i = 0; i < nsh; i++) if (shW[i] > mw) mw = shW[i];
+    levCnt = ilog2(mw);
+    levSpan = (1LL << (levCnt + 1)) - 2;
+    for (i = 0; i < nsh; i++) {
+        int len = 1;
+        shNStep[i] = 0;
+        while (len < shH[i] && shNStep[i] < 40) {
+            int step = (len < shH[i] - len) ? len : shH[i] - len;
+            shStep[i][shNStep[i]++] = step;
+            len += step;
+        }
+    }
+}
+
+/* ---------- solution snapshot ---------- */
+
+static char *snapA;
+static int *snapCnt;
+static size_t *snapStart;
+static RB *snapPool;
+static size_t snapCap, snapUsed;
+static long long snapP = -1;     /* profit of the snapshot, -1: none */
+static int snapOut;          /* 1: the answer is the snapshot (grid not restored) */
+
+/* copy of the current solution (RBs of every served user) */
+static void save_snapshot(void) {
+    size_t used = 0;
+    int i;
+    snapP = -1;
+    if (!snapA) {                   /* allocated on first use; failure = no snapshot */
+        snapA = (char *)malloc((size_t)N + 1);
+        snapCnt = (int *)malloc(sizeof(int) * ((size_t)N + 1));
+        snapStart = (size_t *)malloc(sizeof(size_t) * ((size_t)N + 1));
+        if (!snapA || !snapCnt || !snapStart) {
+            free(snapA); free(snapCnt); free(snapStart);
+            snapA = 0; snapCnt = 0; snapStart = 0;
+            return;
+        }
+    }
+    for (i = 0; i < N; i++) {
+        User *u = &U[i];
+        snapA[i] = (char)u->assigned;
+        if (!u->assigned) continue;
+        if (used + (size_t)u->nrb > snapCap) {
+            size_t nc = (used + (size_t)u->nrb) * 2 + 64;
+            RB *np = (RB *)realloc(snapPool, sizeof(RB) * nc);
+            if (!np) { snapP = -1; return; }
+            snapPool = np; snapCap = nc;
+        }
+        memcpy(snapPool + used, u->rbs, sizeof(RB) * (size_t)u->nrb);
+        snapStart[i] = used; snapCnt[i] = u->nrb; used += (size_t)u->nrb;
+    }
+    snapP = curProfit;
+    snapUsed = used;
+    ops += N + (long long)used * 2;
+}
+
+/* rebuild the grid from the snapshot */
+static void restore_snapshot(void) {
+    int i, r;
+    clear_all();
+    for (i = 0; i < N; i++) {
+        User *u = &U[i];
+        if (!snapA[i]) continue;
+        if (u->cap < snapCnt[i]) {
+            RB *nr = (RB *)realloc(u->rbs, sizeof(RB) * (size_t)snapCnt[i]);
+            if (!nr) continue;
+            u->rbs = nr; u->cap = snapCnt[i];
+        }
+        memcpy(u->rbs, snapPool + snapStart[i], sizeof(RB) * (size_t)snapCnt[i]);
+        u->nrb = snapCnt[i];
+        u->assigned = 1;
+        curProfit += u->profit;
+        curArea += (long long)u->nrb * S;
+        curOwner = i;
+        for (r = 0; r < u->nrb; r++) mark_rb(&u->rbs[r], 1);
+    }
+}
+
+/* ---------- construction (greedy) ---------- */
+
+/*
+ * Construction modes:
+ *   GR_TRY    : lookahead; at checkpoints, switches to the cheap mode when the
+ *               projected cost of the rest exceeds the budget (every user must
+ *               still be reached), and records its cost profile.
+ *   GR_PLANNED: uses the recorded profile to decide segment by segment whether
+ *               the lookahead still leaves enough budget for the cheap mode to
+ *               reach every later user.
+ *   GR_PLAIN  : fixed lookahead.
+ */
+#define GR_PLAIN 0
+#define GR_PLANNED 2
+#define GR_TRY 3
+#define NCP 512                     /* checkpoints of the cost profile */
+static long long cpOps[NCP + 2], cpTot;
+static char cpLean[NCP + 2];                 /* segment ran in the cheap mode */
+static double cpWide[NCP + 2], cpLeanRest[NCP + 3];
+static int cpStep, cpValid, greedySwitched;
+
+/* one request with only its options of more than MAX_RB RBs, in the cheap mode
+   (all masks stay exact when called between wide placements) */
+static int place_big(User *u) {
+    int r, lm = leanMode;
+    unsigned keep = leanKeep;
+    long long o0 = ops;
+    if (u->assigned) return 0;
+    if (!lm) leanKeep = ~0U;
+    leanMode = 1;
+    bigPhase = 1;
+    r = place_user(u);
+    bigPhase = 0;
+    ops += (ops - o0) * (LEAN_MUL4 - 4) / 4;
+    leanMode = lm;
+    leanKeep = keep;
+    return r;
+}
+
+static int longWhole;           /* the last first construction kept the long lookahead to the end */
+
+/*
+ * Measured: on large inputs a construction takes more time per counted unit
+ * than the local search (it walks every request once, missing the cache), the
+ * more so with many requests and with many rows.  Its work is charged
+ * (1 + consExtra) times.
+ */
+#define CONS_N 0.5                  /* extra share at 200000 requests and more */
+#define CONS_W 0.1                  /* extra share per doubling of the row words */
+static double consExtra;
+static double loadRatio;        /* total smallest area of the requests / grid area */
+
+/* greedy in priority order v within `budget` operations; returns 1 if every
+   user was processed */
+static int greedy(int v, long long budget, int mode) {
+    int i, nAss = 0, j, overCnt = 0, firstFitUsers = 0, bj = 0, longOn = 0, longEnd = 0, segI = 0, longI = 0;
+    long long start = ops, wide = lookMul, segOps = ops, segPlaced = 0, placedNow = 0, longCap = 0, longOps = 0;
+    long long wOps = 0, wUsers = 0, fOps = 0, fUsers = 0, o0;   /* cost by mode (GR_TRY) */
+    double rateW = 0, rateF = 0, ratioWF = 0;
+    clear_all();
+    leanKeep = ~0U; leanUseTot = 0; leanWork = staleWork = 0;
+    for (j = 0; j < nsh; j++) leanUse[j] = 0;
+    while (nAss < N && U[order[v][nAss]].nopt > 0) nAss++;
+    if (mode == GR_TRY) { cpStep = nAss / NCP > 0 ? nAss / NCP : 1; cpValid = 0; }
+    greedySwitched = 0;
+    /* oversubscribed grid: the leading requests whose smallest areas fill the
+       grid (the "core") decide the profit, so they get a long lookahead,
+       halved while the rest of the core would not fit in a share of the budget */
+    if (mode == GR_TRY && LONG_LOOK > wide && wide > 0 && loadRatio >= LONG_LOAD) {
+        double cap = (double)X * Y * LONG_CORE100 / 100.0, acc = 0;
+        for (longEnd = 0; longEnd < nAss && acc <= cap; longEnd++) acc += (double)U[order[v][longEnd]].minArea;
+        ops += longEnd;
+        longCap = budget / 100 * LONG_FRAC100;
+        lookMul = LONG_LOOK; longOn = 1; longOps = ops; longI = 0;
+    }
+    for (i = 0; i < nAss && ops - start <= budget; i++) {
+        if (longOn && i < longEnd && (i & 63) == 0 && i - longI >= 256 && lookMul > LONG_MIN) {
+            /* halve the lookahead while the rest of the core would not fit in the cap */
+            double rate = (double)(ops - longOps) / (double)(i - longI);
+            if ((double)(ops - start) + rate * (double)(longEnd - i) > (double)longCap) {
+                lookMul /= 2;
+                longOps = ops; longI = i;
+            }
+        }
+        if (longOn && (i >= longEnd || ((i & 63) == 0 && ops - start > longCap))) {
+            longOn = 0;
+            lookMul = wide;
+            segOps = ops; segPlaced = placedNow; segI = i;
+        }
+        if (mode == GR_TRY && nAss >= 128 && i > 0 && i % (nAss / 64) == 0) {
+            /* keep the wide lookahead for the next stretch only if first fit can
+               still reach every later request afterwards (projected from the cost
+               of the last stretch; later requests tend to be cheaper) */
+            long long seg = nAss / 64, rem = nAss - i;
+            double rate, r4, r0, need;
+            int fits;
+            if (longOn || i - segI < seg / 4) goto cp_done;    /* not measured yet */
+            rate = (double)(ops - segOps) / (double)(i - segI);
+            /* most of the last stretch placed: the cheap mode loses little, so
+               reaching every request matters more than the lookahead */
+            fits = (placedNow - segPlaced) * 10 >= (i - segI) * 3;
+            if (!leanMode) rateW = rate; else rateF = rate;
+            if (rateF <= 0) {
+                /* cheap mode not measured yet: assume 0.65 of the lookahead cost */
+                r4 = rateW; r0 = rateW * 0.65;
+                need = (double)(ops - start) + 0.85 * (r4 * (double)seg + r0 * (double)(rem - seg));
+            } else {
+                r4 = rateW > 0 ? rateW : rateF / 0.65;
+                r0 = rateF;
+                need = (double)(ops - start) + r4 * (double)seg + (fits ? 1.0 : 0.85) * r0 * (double)(rem - seg);
+            }
+            /* a single expensive stretch (often the first ones) is not enough
+               evidence: switch to the cheap mode after two over-budget checkpoints */
+            overCnt = need > (double)budget ? overCnt + 1 : 0;
+            if (!leanMode) { if (overCnt >= 2) leanMode = 1; }
+            else if (need <= (fits ? 0.9 : 1.0) * (double)budget) { leanMode = 0; refresh_dirty(); }
+            if (leanMode) update_lean_keep(nAss);
+            segOps = ops;
+            segPlaced = placedNow;
+            segI = i;
+        }
+    cp_done:
+        if (mode != GR_PLAIN && cpStep > 0 && i % cpStep == 0 && (j = i / cpStep) <= NCP) {
+            if (mode == GR_TRY) { cpOps[j] = ops - start; cpLean[j] = (char)leanMode; }
+            else if (mode == GR_PLANNED) {
+                /* wide lookahead for the next segment only if the cheap mode can
+                   still reach every later request afterwards */
+                double need = (double)(ops - start) + 1.15 * cpWide[j] + 1.1 * cpLeanRest[j + 1];
+                leanMode = need <= (double)budget ? 0 : 1;
+                if (!leanMode && shDirty) refresh_dirty();
+                if (leanMode && (j & 7) == 0) update_lean_keep(nAss);
+            }
+        }
+        if (mode == GR_TRY && leanMode) firstFitUsers++;
+        if (v == 0 && bigKeyV) {
+            /* options with more than MAX_RB RBs go at their own profit per area */
+            const User *uu = &U[order[v][i]];
+            double ku = (double)uu->profit / (double)uu->minArea;
+            while (bj < nBig && bigKeyV[bj] > ku && ops - start <= budget) placedNow += place_big(&U[bigIdx[bj++]]);
+        }
+        o0 = ops;
+        placedNow += place_user(&U[order[v][i]]);
+        ops += (long long)((double)(ops - o0) * consExtra);   /* cache misses of large inputs */
+        if (leanMode) {
+            /* measured: the cheap mode takes more time per counted unit */
+            ops += (ops - o0) * (LEAN_MUL4 - 4) / 4;
+            fOps += ops - o0; fUsers++;
+            leanWork += ops - o0;
+        } else { wOps += ops - o0; wUsers++; }
+    }
+    /* the requests needing more than MAX_RB RBs not reached yet: in the space left */
+    if (nBig > 0 && ops - start <= budget) {
+        if (shDirty) refresh_dirty();
+        leanMode = 0;
+        for (; bj < nBig && ops - start <= budget; bj++) placedNow += place_big(&U[bigIdx[bj]]);
+    }
+    /* the planned pass pays off only if a real share went without lookahead */
+    greedySwitched = firstFitUsers * 20 >= nAss;
+    if (mode == GR_TRY) longWhole = longOn;
+    lookMul = wide;
+    leanMode = 0;
+    if (mode == GR_TRY) {
+        int last = i / cpStep;
+        cpValid = i == nAss;
+        cpTot = ops - start;
+        for (j = last + 1; j <= NCP; j++) { cpOps[j] = cpTot; cpLean[j] = 0; }
+        /* cost of each recorded segment in either mode: measured per-user cost
+           ratio of the wide mode to the cheap mode */
+        if (wUsers > 0 && fUsers > 0) ratioWF = ((double)wOps / wUsers) / ((double)fOps / fUsers);
+        if (ratioWF < 1.0) ratioWF = 1.0;
+        cpLeanRest[NCP + 1] = 0;
+        for (j = NCP; j >= 0; j--) {
+            long long segEnd = (j + 1 <= NCP && (long long)(j + 1) * cpStep < nAss) ? cpOps[j + 1] : cpTot;
+            double c = (double)(segEnd - cpOps[j]);
+            if (c < 0) c = 0;
+            if (j > last) c = 0;
+            cpWide[j] = cpLean[j] ? c * (ratioWF > 0 ? ratioWF : 1.0 / 0.65) : c;
+            cpLeanRest[j] = cpLeanRest[j + 1] + (cpLean[j] ? c : c / (ratioWF > 0 ? ratioWF : 1.0 / 0.65));
+        }
+    }
+    return i == nAss;
 }
 
 /* ---------- local search ---------- */
@@ -1764,14 +2255,12 @@ static int curVar;
 static int unsortedArr;     /* 1 if arrival is not nondecreasing by index */
 static int ry0, ry1;        /* row range of the current ruin region       */
 
-static int cmp_rank(const void *p, const void *q)
-{
+static int cmp_rank(const void *p, const void *q) {
     int a = rankv[curVar][*(const int *)p], b = rankv[curVar][*(const int *)q];
     return (a > b) - (a < b);
 }
 
-static int intersects(const User *u, int t0, int t1)
-{
+static int intersects(const User *u, int t0, int t1) {
     int i;
     for (i = 0; i < u->nrb; i++) {
         const RB *r = &u->rbs[i];
@@ -1781,20 +2270,16 @@ static int intersects(const User *u, int t0, int t1)
     return 0;
 }
 
-/* returns 1 if a strictly better state was reached */
 static int *ulist[NVAR], ulen[NVAR];   /* unassigned users per priority order */
 static long long maxWin, lnsLavg = 1;   /* longest / average request window */
 static long long lnsSteps;
 
-#ifndef ULIST_AGE
 #define ULIST_AGE (512 + N / 200)        /* refills between rebuilds of an unassigned list */
-#endif
 static long long ulistAgeV[NVAR];
 static int ulistInit;
 
 /* unassigned users of priority order v (rebuilt lazily, one order at a time) */
-static void rebuild_ulist(int v)
-{
+static void rebuild_ulist(int v) {
     int i;
     ulen[v] = 0;
     for (i = 0; i < N; i++) {
@@ -1804,23 +2289,13 @@ static void rebuild_ulist(int v)
     }
     ops += (long long)i * 24 + 16;      /* scattered reads of U: cache misses */
 }
-#ifndef REG_USERS
+
 #define REG_USERS 256               /* largest region: about this many average requests */
-#endif
-#ifndef LNS_EXTRA
 #define LNS_EXTRA 24                /* refill candidates: the removed requests and this many more */
-#endif
-#ifndef SA_EXTRA
 #define SA_EXTRA 24                 /* the same in the threshold phase */
-#endif
-#ifndef LDS_STALL
 #define LDS_STALL 10                /* no gain for 1/LDS_STALL of the search budget: stalled */
-#endif
-#ifndef LDS_MAX
 #define LDS_MAX 48                  /* refills of at most this many requests try one discrepancy */
-#endif
 static int skipIds[LDS_MAX + 1];
-static long long ldsHits;
 static int ldsOn;               /* the plain search has stalled: refills try a discrepancy */
 static long long lastImpOps;    /* when the local search last improved */
 static long long lnsStart, lnsStall;    /* start of the local search; no gain this long = stalled */
@@ -1829,8 +2304,7 @@ static long long lastImpStep, passSteps = -1;   /* steps: at the last gain, in o
 static long long allProfit = -1;    /* profit of every request that has an option */
 
 /* after every local search step: nothing is left to gain once everybody is served */
-static void lns_check(void)
-{
+static void lns_check(void) {
     if (curProfit >= allProfit && allProfit >= 0) opsEnd = ops;
 }
 
@@ -1855,49 +2329,43 @@ static int bestIsCur = 1;           /* the current solution is the best one  */
 typedef struct { double k; int id; } SaKey;
 static SaKey *saBuf;
 
-static int cmp_sakey(const void *p, const void *q)
-{
+static int cmp_sakey(const void *p, const void *q) {
     const SaKey *a = (const SaKey *)p, *b = (const SaKey *)q;
     if (a->k != b->k) return a->k > b->k ? -1 : 1;
     return (a->id > b->id) - (a->id < b->id);
 }
 
-#ifndef SA_ALLOW
-#define SA_ALLOW 1
-#endif
-static int sa_keep_worse(long long oldP, long long oldA, int nr, int na);
-static int saAllowed = SA_ALLOW;
+static int sa_keep_worse(long long oldP, int nr, int na);
+static int saAllowed = 1;           /* 0: no memory for the threshold phase  */
 
 /* no gain for a long share of the budget, or for two full passes of the
    sweep over every region */
-static int is_stalled(void)
-{
+static int is_stalled(void) {
     return ops - lastImpOps > lnsStall || (passSteps > 0 && lnsSteps - lastImpStep > 2 * passSteps);
 }
 
 /* the sweep has gone a while without gain: first try one discrepancy per
    refill, then (if that stalls too) the threshold phase */
-static void stalled(void)
-{
+static void stalled(void) {
     if (!ldsOn) { ldsOn = 1; lastImpOps = ops; lastImpStep = lnsSteps; }
     else if (saAllowed) saOn = 1;
 }
 
-#ifdef DIAG
-long long dgSteps, dgNr, dgNc, dgNa, dgImp, dgEq, dgWorse;
-#endif
-static int lns_step(int t0, int t1, int v)
-{
+/*
+ * One ruin-and-recreate step on the region columns [t0, t1] x rows [ry0, ry1]:
+ * remove every user with an RB in it, refill with the removed users and up to
+ * LNS_EXTRA unserved users whose window meets the region (by rank in order v).
+ * Kept if the profit grows, or stays equal with no more area; otherwise the
+ * region is restored.  Returns 1 if a strictly better state was reached.
+ */
+static int lns_step(int t0, int t1, int v) {
     long long oldP = curProfit, oldA = curArea;
-    int nr = 0, nc = 0, na = 0, i, j, lim, hi;
+    int nr = 0, nc = 0, na = 0, i, j, lim, hi, lo = 0, h2 = N;
     size_t pu = 0;
 
     /* users with arrival <= t1 form a prefix when arrivals are sorted */
-    {
-        int lo = 0, h2 = N;
-        while (lo < h2) { int md = lo + (h2 - lo) / 2; if (U[md].arr <= t1) lo = md + 1; else h2 = md; }
-        hi = unsortedArr ? N : lo;
-    }
+    while (lo < h2) { int md = lo + (h2 - lo) / 2; if (U[md].arr <= t1) lo = md + 1; else h2 = md; }
+    hi = unsortedArr ? N : lo;
     if (useOwn) {
         /* owners of the cells inside the region */
         int x, y;
@@ -1936,8 +2404,8 @@ static int lns_step(int t0, int t1, int v)
     lim = nr + (saOn ? SA_EXTRA : LNS_EXTRA);
     if (!unsortedArr) {
         /* users that can intersect [t0, t1] have arrival in [t0 - maxWin, t1] */
-        int lo = 0, h2 = N;
         long long from = (long long)t0 - maxWin;
+        lo = 0; h2 = N;
         while (lo < h2) { int md = lo + (h2 - lo) / 2; if (U[md].arr < from) lo = md + 1; else h2 = md; }
         /* scan the arrival range (sequential) unless walking the unassigned list
            (scattered reads; about one in X / (region + window) entries fits) is cheaper */
@@ -2014,14 +2482,6 @@ static int lns_step(int t0, int t1, int v)
     for (i = 0; i < nc && ops <= hardLimit; i++)
         if (place_user(&U[candList[i]])) addList[na++] = candList[i];
 
-#ifdef DIAG
-    {
-        extern long long dgSteps, dgNr, dgNc, dgNa, dgImp, dgEq;
-        dgSteps++; dgNr += nr; dgNc += nc; dgNa += na;
-        if (curProfit > oldP || (curProfit == oldP && curArea < oldA)) dgImp++;
-        else if (curProfit == oldP && curArea == oldA) dgEq++;
-    }
-#endif
     /* keep: more profit, or equal profit with no more area */
     if (curProfit > oldP || (curProfit == oldP && curArea <= oldA)) {
         if (curProfit > oldP || curArea < oldA) { lastImpOps = ops; lastImpStep = lnsSteps; }
@@ -2030,14 +2490,10 @@ static int lns_step(int t0, int t1, int v)
         }
         return curProfit > oldP || curArea < oldA;
     }
-    if (saOn && sa_keep_worse(oldP, oldA, nr, na)) return 0;
-#ifdef LDS_MAX
+    if (saOn && sa_keep_worse(oldP, nr, na)) return 0;
     /* one discrepancy: leave out one of the requests the refill placed, so
        that others may fit instead; the first strict improvement is kept */
-#ifndef SA_LDS
-#define SA_LDS 0
-#endif
-    if (ldsOn && (SA_LDS || !saOn) && nc <= LDS_MAX) {
+    if (ldsOn && !saOn && nc <= LDS_MAX) {
         int na0 = na, q;
         for (q = 0; q < na0; q++) skipIds[q] = addList[q];
         for (q = 0; q < na0 && ops <= hardLimit; q++) {
@@ -2047,11 +2503,10 @@ static int lns_step(int t0, int t1, int v)
                 if (candList[i] == skipIds[q]) continue;
                 if (place_user(&U[candList[i]])) addList[na++] = candList[i];
             }
-            if (curProfit > oldP || (curProfit == oldP && curArea < oldA)) { ldsHits++; lastImpOps = ops; lastImpStep = lnsSteps; return 1; }
+            if (curProfit > oldP || (curProfit == oldP && curArea < oldA)) { lastImpOps = ops; lastImpStep = lnsSteps; return 1; }
         }
     }
-#endif
-
+    /* no gain: put the region back as it was */
     unassign_batch(addList, na);
     for (i = 0; i < nr; i++) {
         User *u = &U[remList[i]];
@@ -2067,156 +2522,13 @@ static int lns_step(int t0, int t1, int v)
 }
 
 /*
- * Masks of shape s for start columns lo..hi, recomputed from the occupancy
- * (in pieces that fit the scratch buffers).
- */
-static void refresh_shape(int s, long long lo, long long hi)
-{
-    long long step = 2LL * maxShW + 64, x;
-    int j0 = jOn;
-    if (lo < 0) lo = 0;
-    if (hi > (long long)X - shW[s]) hi = (long long)X - shW[s];
-    jOn = 0;                            /* never undone */
-    for (x = lo; x <= hi; x += step) fz_update(s, x, x + step - 1 > hi ? hi : x + step - 1);
-    jOn = j0;
-}
-
-/* bring every stale mask up to date (before anything but the cheap mode reads them) */
-static void refresh_dirty(void)
-{
-    int s;
-    for (s = 0; s < nsh; s++)
-        if ((shDirty >> s) & 1U) refresh_shape(s, 0, (long long)X - 1);
-    shDirty = 0;
-}
-
-/* shapes the cheap mode keeps up to date: those it used for at least 2% of its
-   placements in this pass (all of them until it has placed 1/16 of the requests:
-   the leading requests are the most valuable ones) */
-static void update_lean_keep(int nAss)
-{
-    unsigned keep = 0;
-    int s;
-    if (leanUseTot < 256 || leanUseTot < nAss / 16) return;
-    for (s = 0; s < nsh; s++)
-        if (leanUse[s] * 50 >= leanUseTot) keep |= 1U << s;
-    for (s = 0; s < nsh; s++)
-        if (((keep & shDirty) >> s) & 1U) {   /* needed again: rebuild it */
-            refresh_shape(s, 0, (long long)X - 1);
-            shDirty &= ~(1U << s);
-        }
-    leanKeep = keep;
-}
-
-static void clear_all(void)
-{
-    int i;
-    for (i = 0; i < N; i++) U[i].assigned = 0;
-    shDirty = 0;
-    for (i = 0; i < nlev; i++) memset(lev[i], 0, sizeof(u64) * (size_t)X * W);
-    memset(fen, 0, sizeof(long long) * ((size_t)nBlk + 1));
-    if (useRow) memset(rowOcc, 0, sizeof(u64) * (size_t)Y * fzWords);
-    if (useOwn && ownLive) { size_t c2, nc2 = (size_t)X * Y; for (c2 = 0; c2 < nc2; c2++) own[c2] = -1; }
-    ops += (long long)X * W * 2 + (long long)N;
-    for (i = 0; i < nsh; i++) {
-        int x;
-        if (!((usedSh >> i) & 1U)) continue;
-        ops += (long long)X * W;
-        {
-            int xm = X - shW[i], c;       /* starts 0..xm are free on an empty grid */
-            u64 *F = fm[i];
-            memset(fz[i], 0, sizeof(u64) * (size_t)fzWords);
-            runs(scMm, scAll, shH[i]);
-            if (W == 1) {
-                u64 v = scMm[0];
-                for (x = 0; x <= xm; x++) F[x] = v;
-                for (; x <= X; x++) F[x] = 0;
-            } else {
-                for (x = 0; x <= xm; x++)
-                    for (c = 0; c < W; c++) F[(size_t)x * W + c] = scMm[c];
-                memset(F + (size_t)(xm + 1) * W, 0, sizeof(u64) * (size_t)(X - xm) * W);
-            }
-            for (x = 0; x + 63 <= xm; x += 64) fz[i][x >> 6] = ~0ULL;
-            for (; x <= xm; x++) fz[i][x >> 6] |= 1ULL << (x & 63);
-        }
-        memset(fzs[i], 0, sizeof(u64) * (size_t)fzsWords);
-        fzs_fix(i, 0, fzWords - 1);
-    }
-    curProfit = 0; curArea = 0;
-}
-
-/* owner grid from the users' RBs */
-static void rebuild_owner(void)
-{
-    size_t c2, nc2 = (size_t)X * Y;
-    int i, r, c, yy;
-    for (c2 = 0; c2 < nc2; c2++) own[c2] = -1;
-    for (i = 0; i < N; i++) {
-        const User *u = &U[i];
-        if (!u->assigned) continue;
-        for (r = 0; r < u->nrb; r++) {
-            const RB *rb = &u->rbs[r];
-            for (c = rb->x; c < rb->x + rb->w; c++) {
-                int *o = own + (size_t)c * Y + rb->y;
-                for (yy = 0; yy < rb->h; yy++) o[yy] = i;
-            }
-        }
-    }
-    ops += (long long)(nc2 / 4) + (long long)N;
-}
-
-/* ---------- solution snapshot ---------- */
-
-static char *snapA;
-static int *snapCnt;
-static size_t *snapStart;
-static RB *snapPool;
-static size_t snapCap, snapUsed;
-static long long snapP = -1, snapArea;
-static int snapOut;          /* 1: the answer is the snapshot (grid not restored) */
-
-static void save_snapshot(void)
-{
-    size_t used = 0;
-    int i;
-    snapP = -1;
-    if (!snapA) {                   /* allocated on first use; failure = no snapshot */
-        snapA = (char *)malloc((size_t)N + 1);
-        snapCnt = (int *)malloc(sizeof(int) * ((size_t)N + 1));
-        snapStart = (size_t *)malloc(sizeof(size_t) * ((size_t)N + 1));
-        if (!snapA || !snapCnt || !snapStart) {
-            free(snapA); free(snapCnt); free(snapStart);
-            snapA = 0; snapCnt = 0; snapStart = 0;
-            return;
-        }
-    }
-    for (i = 0; i < N; i++) {
-        User *u = &U[i];
-        snapA[i] = (char)u->assigned;
-        if (!u->assigned) continue;
-        if (used + (size_t)u->nrb > snapCap) {
-            size_t nc = (used + (size_t)u->nrb) * 2 + 64;
-            RB *np = (RB *)realloc(snapPool, sizeof(RB) * nc);
-            if (!np) { snapP = -1; return; }
-            snapPool = np; snapCap = nc;
-        }
-        memcpy(snapPool + used, u->rbs, sizeof(RB) * (size_t)u->nrb);
-        snapStart[i] = used; snapCnt[i] = u->nrb; used += (size_t)u->nrb;
-    }
-    snapP = curProfit; snapArea = curArea;
-    snapUsed = used;
-    ops += N + (long long)used * 2;
-}
-
-/*
  * Threshold phase: keep the refill just made although it lost profit (or kept
  * the profit with more area) if the loss is at most the threshold.  If the
  * state before it was the best one, that state is saved first: the current
  * solution, with the refill's requests taken out and the removed requests put
  * back.
  */
-static int sa_keep_worse(long long oldP, long long oldA, int nr, int na)
-{
+static int sa_keep_worse(long long oldP, int nr, int na) {
     double loss = (double)(oldP - curProfit);
     int i;
     if (saThr <= 0 || loss > saThr) return 0;
@@ -2238,577 +2550,22 @@ static int sa_keep_worse(long long oldP, long long oldA, int nr, int na)
             snapA[id] = 1; snapStart[id] = used; snapCnt[id] = remCnt[i];
             used += (size_t)remCnt[i];
         }
-        snapP = oldP; snapArea = oldA;
+        snapP = oldP;
         ops += 4LL * (nr + na);
         bestIsCur = 0;
     }
-#ifdef DIAG
-    dgWorse++;
-#endif
     return 1;
 }
 
-static void restore_snapshot(void)
-{
-    int i, r;
-    clear_all();
-    for (i = 0; i < N; i++) {
-        User *u = &U[i];
-        if (!snapA[i]) continue;
-        if (u->cap < snapCnt[i]) {
-            RB *nr = (RB *)realloc(u->rbs, sizeof(RB) * (size_t)snapCnt[i]);
-            if (!nr) continue;
-            u->rbs = nr; u->cap = snapCnt[i];
-        }
-        memcpy(u->rbs, snapPool + snapStart[i], sizeof(RB) * (size_t)snapCnt[i]);
-        u->nrb = snapCnt[i];
-        u->assigned = 1;
-        curProfit += u->profit;
-        curArea += (long long)u->nrb * S;
-        curOwner = i;
-        for (r = 0; r < u->nrb; r++) mark_rb(&u->rbs[r], 1);
-    }
-}
+/* ---------- threshold phase ---------- */
 
-/* greedy in priority order v, limited to `budget` operations (deterministic) */
-/*
- * Construction modes.
- *   GR_PLAIN  : fixed lookahead.
- *   GR_RECORD : fixed lookahead, records the cumulative cost at 512 checkpoints.
- *   GR_PLANNED: uses the recorded first-fit cost profile to place as many of the
- *               leading (most valuable) requests as possible with the wide
- *               lookahead, while keeping enough budget to reach every request
- *               with first fit.  A request that is never reached is lost, so
- *               reaching all of them comes first.
- * Returns 1 if every request was processed.
- */
-#define GR_PLAIN 0
-#define GR_RECORD 1
-#define GR_PLANNED 2
-#define GR_TRY 3      /* fixed lookahead, gives up early if it cannot reach everybody */
-#define NCP 512
-static long long cpOps[NCP + 2], cpTot;
-static char cpLean[NCP + 2];                 /* segment ran in the cheap mode */
-static double cpWide[NCP + 2], cpLeanRest[NCP + 3];
-static int cpStep, cpValid, greedySwitched;
-
-/* one request with only its options of more than MAX_RB RBs, in the cheap mode
-   (all masks stay exact when called between wide placements) */
-static int place_big(User *u)
-{
-    int r, lm = leanMode;
-    unsigned keep = leanKeep;
-    long long o0 = ops;
-    if (u->assigned) return 0;
-    if (!lm) leanKeep = ~0U;
-    leanMode = 1;
-    bigPhase = 1;
-    r = place_user(u);
-    bigPhase = 0;
-    ops += (ops - o0) * (LEAN_MUL4 - 4) / 4;
-    leanMode = lm;
-    leanKeep = keep;
-    return r;
-}
-
-static int longWhole;           /* the last first construction kept the long lookahead to the end */
-/*
- * Measured: on large inputs a construction takes more time per counted unit
- * than the local search (it walks every request once, missing the cache), the
- * more so with many requests and with many rows.  Its work is charged
- * (1 + consExtra) times.
- */
-#ifndef CONS_N
-#define CONS_N 0.5                  /* extra share at 200000 requests and more */
-#endif
-#ifndef CONS_W
-#define CONS_W 0.1                  /* extra share per doubling of the row words */
-#endif
-static double consExtra;
-static double loadRatio;        /* total smallest area of the requests / grid area */
-
-static int greedy(int v, long long budget, int mode)
-{
-    int i, nAss = 0, j, everSwitched = 0, overCnt = 0, firstFitUsers = 0, bj = 0, longOn = 0, longEnd = 0, segI = 0, longI = 0;
-    long long start = ops, wide = lookMul, segOps = ops, segPlaced = 0, placedNow = 0, longCap = 0, longOps = 0;
-    long long wOps = 0, wUsers = 0, fOps = 0, fUsers = 0;   /* cost by mode (GR_TRY) */
-    double rateW = 0, rateF = 0, ratioWF = 0;
-    clear_all();
-    leanKeep = ~0U; leanUseTot = 0; leanWork = staleWork = 0;
-    for (j = 0; j < nsh; j++) leanUse[j] = 0;
-    while (nAss < N && U[order[v][nAss]].nopt > 0) nAss++;
-    if (mode == GR_RECORD || mode == GR_TRY) { cpStep = nAss / NCP > 0 ? nAss / NCP : 1; cpValid = 0; }
-    greedySwitched = 0;
-    /* oversubscribed grid: the leading requests whose smallest areas fill the
-       grid (the "core") decide the profit, so they get a long lookahead,
-       halved while the rest of the core would not fit in a share of the budget */
-    if (mode == GR_TRY && LONG_LOOK > wide && wide > 0 && loadRatio >= LONG_LOAD) {
-        double cap = (double)X * Y * LONG_CORE100 / 100.0, acc = 0;
-        for (longEnd = 0; longEnd < nAss && acc <= cap; longEnd++) acc += (double)U[order[v][longEnd]].minArea;
-        ops += longEnd;
-        longCap = budget / 100 * LONG_FRAC100;
-        lookMul = LONG_LOOK; longOn = 1; longOps = ops; longI = 0;
-    }
-    for (i = 0; i < nAss && ops - start <= budget; i++) {
-        if (longOn && i < longEnd && (i & 63) == 0 && i - longI >= 256 && lookMul > LONG_MIN) {
-            /* halve the lookahead while the rest of the core would not fit in the cap */
-            double rate = (double)(ops - longOps) / (double)(i - longI);
-            if ((double)(ops - start) + rate * (double)(longEnd - i) > (double)longCap) {
-                lookMul /= 2;
-                longOps = ops; longI = i;
-#ifdef DIAG
-                fprintf(stderr, "  long L->%lld at %d\n", lookMul, i);
-#endif
-            }
-        }
-        if (longOn && (i >= longEnd || ((i & 63) == 0 && ops - start > longCap))) {
-#ifdef DIAG
-            fprintf(stderr, "  long off at %d/%d (end %d): used %.3g cap %.3g\n", i, nAss, longEnd, (double)(ops - start), (double)longCap);
-#endif
-            longOn = 0;
-            lookMul = wide;
-            segOps = ops; segPlaced = placedNow; segI = i;
-        }
-        if (mode == GR_TRY && nAss >= 128 && i > 0 && i % (nAss / 64) == 0) {
-            /* keep the wide lookahead for the next stretch only if first fit can
-               still reach every later request afterwards (projected from the cost
-               of the last stretch; later requests tend to be cheaper) */
-            long long seg = nAss / 64, rem = nAss - i;
-            double rate, r4, r0, need;
-            int fits;
-            if (longOn || i - segI < seg / 4) goto cp_done;    /* not measured yet */
-            rate = (double)(ops - segOps) / (double)(i - segI);
-            /* most of the last stretch placed: the cheap mode loses little, so
-               reaching every request matters more than the lookahead */
-            fits = (placedNow - segPlaced) * 10 >= (i - segI) * 3;
-            if (!leanMode) rateW = rate; else rateF = rate;
-            if (rateF <= 0) {
-                /* cheap mode not measured yet: same projection as before */
-                r4 = rateW; r0 = rateW * 0.65;
-                need = (double)(ops - start) + 0.85 * (r4 * (double)seg + r0 * (double)(rem - seg));
-            } else {
-                r4 = rateW > 0 ? rateW : rateF / 0.65;
-                r0 = rateF;
-                need = (double)(ops - start) + r4 * (double)seg + (fits ? 1.0 : 0.85) * r0 * (double)(rem - seg);
-            }
-            /* a single expensive stretch (often the first ones) is not enough
-               evidence: switch to the cheap mode after two over-budget checkpoints */
-            overCnt = need > (double)budget ? overCnt + 1 : 0;
-#ifdef FORCE_LEAN
-            leanMode = 1;
-#else
-            if (!leanMode) { if (overCnt >= 2) leanMode = 1; }
-            else if (need <= (fits ? 0.9 : 1.0) * (double)budget) { leanMode = 0; refresh_dirty(); }
-#endif
-            if (leanMode) update_lean_keep(nAss);
-            segOps = ops;
-            segPlaced = placedNow;
-            segI = i;
-        }
-    cp_done:
-        if (mode != GR_PLAIN && cpStep > 0 && i % cpStep == 0 && (j = i / cpStep) <= NCP) {
-            if (mode == GR_RECORD || mode == GR_TRY) { cpOps[j] = ops - start; cpLean[j] = (char)leanMode; }
-            else if (mode == GR_PLANNED) {
-                /* wide lookahead for the next segment only if the cheap mode can
-                   still reach every later request afterwards */
-                double need = (double)(ops - start) + 1.15 * cpWide[j] + 1.1 * cpLeanRest[j + 1];
-                leanMode = need <= (double)budget ? 0 : 1;
-                if (!leanMode && shDirty) refresh_dirty();
-                if (leanMode && (j & 7) == 0) update_lean_keep(nAss);
-            }
-        }
-        if (mode == GR_TRY && leanMode) firstFitUsers++;
-#ifdef FORCE_LEAN
-        leanMode = 1;
-#endif
-        if (v == 0 && bigKeyV) {
-            /* options with more than MAX_RB RBs go at their own profit per area */
-            const User *uu = &U[order[v][i]];
-            double ku = (double)uu->profit / (double)uu->minArea;
-            while (bj < nBig && bigKeyV[bj] > ku && ops - start <= budget) placedNow += place_big(&U[bigIdx[bj++]]);
-        }
-        {
-            long long o0 = ops;
-            placedNow += place_user(&U[order[v][i]]);
-            ops += (long long)((double)(ops - o0) * consExtra);   /* cache misses of large inputs */
-            if (leanMode) {
-                /* measured: the cheap mode takes more time per counted unit */
-                ops += (ops - o0) * (LEAN_MUL4 - 4) / 4;
-                fOps += ops - o0; fUsers++;
-                leanWork += ops - o0;
-            } else { wOps += ops - o0; wUsers++; }
-        }
-    }
-    /* the requests needing more than MAX_RB RBs not reached yet: in the space left */
-    if (nBig > 0 && ops - start <= budget) {
-        if (shDirty) refresh_dirty();
-        leanMode = 0;
-        for (; bj < nBig && ops - start <= budget; bj++) placedNow += place_big(&U[bigIdx[bj]]);
-    }
-    /* the planned pass pays off only if a real share went without lookahead */
-    greedySwitched = firstFitUsers * 20 >= nAss;
-    if (mode == GR_TRY) longWhole = longOn;
-    (void)everSwitched; (void)rateW; (void)rateF;
-    lookMul = wide;
-    leanMode = 0;
-    if (mode == GR_RECORD || mode == GR_TRY) {
-        int last = i / cpStep;
-        cpValid = i == nAss;
-        cpTot = ops - start;
-        for (j = last + 1; j <= NCP; j++) { cpOps[j] = cpTot; cpLean[j] = 0; }
-        /* cost of each recorded segment in either mode: measured per-user cost
-           ratio of the wide mode to the cheap mode */
-        if (wUsers > 0 && fUsers > 0) ratioWF = ((double)wOps / wUsers) / ((double)fOps / fUsers);
-#ifdef DIAG
-        fprintf(stderr, "  modes: wide %lld users %.3g ops | cheap %lld users %.3g ops | ratio %.2f\n", wUsers, (double)wOps, fUsers, (double)fOps, ratioWF);
-#endif
-        if (ratioWF < 1.0) ratioWF = 1.0;
-        cpLeanRest[NCP + 1] = 0;
-        for (j = NCP; j >= 0; j--) {
-            long long segEnd = (j + 1 <= NCP && (long long)(j + 1) * cpStep < nAss) ? cpOps[j + 1] : cpTot;
-            double c = (double)(segEnd - cpOps[j]);
-            if (c < 0) c = 0;
-            if (j > last) c = 0;
-            cpWide[j] = cpLean[j] ? c * (ratioWF > 0 ? ratioWF : 1.0 / 0.65) : c;
-            cpLeanRest[j] = cpLeanRest[j + 1] + (cpLean[j] ? c : c / (ratioWF > 0 ? ratioWF : 1.0 / 0.65));
-        }
-    }
-    return i == nAss;
-}
-
-static int cmp_int(const void *p, const void *q)
-{
-    int a = *(const int *)p, b = *(const int *)q;
-    return (a > b) - (a < b);
-}
-
-static int cmp_by_id(const void *p, const void *q)
-{
-    int a = *(const int *)p, b = *(const int *)q;
-    if (U[a].id != U[b].id) return U[a].id < U[b].id ? -1 : 1;
-    return (a > b) - (a < b);
-}
-
-static void print_empty(void)
-{
-    printf("0 0\n");
-}
-
-static void *xmalloc(size_t n)
-{
-    void *p = malloc(n ? n : 1);
-    if (!p) { print_empty(); exit(0); }
-    return p;
-}
-
-static void *xcalloc(size_t n, size_t sz)
-{
-    void *p = calloc(n ? n : 1, sz ? sz : 1);
-    if (!p) { print_empty(); exit(0); }
-    return p;
-}
-
-/* ---------- buffered output ---------- */
-
-#define OUT_CAP (1 << 20)
-static char *outBuf;
-static size_t outLen;
-
-static void out_flush(void)
-{
-    if (outLen) fwrite(outBuf, 1, outLen, stdout);
-    outLen = 0;
-}
-
-static void out_room(size_t n)              /* make room for n more bytes */
-{
-    if (outLen + n > OUT_CAP) out_flush();
-}
-
-static void out_c(char c)
-{
-    if (outLen + 1 > OUT_CAP) out_flush();
-    outBuf[outLen++] = c;
-}
-
-static void out_ll(long long v)
-{
-    char tmp[24];
-    int n = 0;
-    unsigned long long u;
-    if (outLen + 24 > OUT_CAP) out_flush();
-    if (v < 0) { outBuf[outLen++] = '-'; u = (unsigned long long)(-(v + 1)) + 1ULL; }
-    else u = (unsigned long long)v;
-    do { tmp[n++] = (char)('0' + (int)(u % 10)); u /= 10; } while (u);
-    while (n) outBuf[outLen++] = tmp[--n];
-}
-
-/* ---------- time-axis compression ---------- */
-
-/*
- * Only columns inside some request's window can ever hold an RB, so the time
- * axis is rebuilt from the merged windows ("segments") with one free column
- * between segments (and before / after them where the original had room).
- * Contacts and every rule are unchanged by this.  If even that is too long
- * for memory, windows are cut to their first `cap` columns (cap >= widest shape).
- */
-static int nSeg, *segC, *segL;
-static long long *segO;          /* original start of each segment */
-static long long Xorig;
-static int *cmpIdx;
-static long long *oA, *oD;       /* original windows when X does not fit an int */
-
-static long long win_a(int i) { return oA ? oA[i] : U[i].arr; }
-static long long win_d(int i) { return oA ? oD[i] : U[i].dl; }
-
-static int cmp_arr_idx(const void *p, const void *q)
-{
-    int a = *(const int *)p, b = *(const int *)q;
-    if (win_a(a) != win_a(b)) return win_a(a) < win_a(b) ? -1 : 1;
-    return (a > b) - (a < b);
-}
-
-/* compressed length for a window cap; fills the segment arrays if build */
-static long long comp_len(int nIdx, long long cap, int build)
-{
-    long long tot = 0, cs = -1, ce = -2;
-    int i, ns = 0;
-    for (i = 0; i < nIdx; i++) {
-        long long a = win_a(cmpIdx[i]), e = win_d(cmpIdx[i]);
-        if (e - a + 1 > cap) e = a + cap - 1;
-        if (a > ce + 1) {
-            if (ce >= cs && cs >= 0) {
-                if (build) { segO[ns] = cs; segL[ns] = (int)(ce - cs + 1); }
-                ns++; tot += ce - cs + 1;
-            }
-            cs = a; ce = e;
-        } else if (e > ce) ce = e;
-    }
-    if (cs >= 0) {
-        if (build) { segO[ns] = cs; segL[ns] = (int)(ce - cs + 1); }
-        ns++; tot += ce - cs + 1;
-    }
-    if (build) nSeg = ns;
-    if (ns == 0) return 1;
-    {
-        long long gaps = ns - 1;
-        if (build) {
-            /* gaps: one separator before the first / after the last segment if room */
-            int k;
-            segC[0] = segO[0] > 0 ? 1 : 0;
-            for (k = 1; k < ns; k++) segC[k] = segC[k - 1] + segL[k - 1] + 1;
-            return (long long)segC[ns - 1] + segL[ns - 1] +
-                   (segO[ns - 1] + segL[ns - 1] < Xorig ? 1 : 0);
-        }
-        return tot + gaps + 2;
-    }
-}
-
-/* monotone map of an original column into the compressed axis */
-static int comp_map(long long x)
-{
-    int lo = 0, hi = nSeg - 1, k = -1;
-    while (lo <= hi) {
-        int md = (lo + hi) / 2;
-        if (segO[md] <= x) { k = md; lo = md + 1; } else hi = md - 1;
-    }
-    if (k < 0) return 0;
-    if (x < segO[k] + segL[k]) return segC[k] + (int)(x - segO[k]);
-    return segC[k] + segL[k];                       /* separator after segment k */
-}
-
-/* original column of a compressed column inside a segment */
-static long long comp_unmap(int x)
-{
-    int lo = 0, hi = nSeg - 1, k = 0;
-    if (!nSeg) return x;
-    while (lo <= hi) {
-        int md = (lo + hi) / 2;
-        if (segC[md] <= x) { k = md; lo = md + 1; } else hi = md - 1;
-    }
-    return segO[k] + (x - segC[k]);
-}
-
-/* windows that cannot be represented: serve nobody rather than misplace */
-static void comp_fail(void)
-{
-    int i;
-    if (!oA) return;
-    for (i = 0; i < N; i++) U[i].nopt = U[i].nbig = 0;
-    free(oA); free(oD); oA = oD = 0;
-    X = 1;
-}
-
-/*
- * Even windows cut to the widest shape do not fit in memory (very wide
- * shapes): keep the requests with the best profit per area while their
- * windows fit; the others cannot be served.  Returns the new count of
- * cmpIdx (still in arrival order).
- */
-static double *keepKey;
-
-static int cmp_keep(const void *p, const void *q)
-{
-    int a = *(const int *)p, b = *(const int *)q;
-    if (keepKey[a] != keepKey[b]) return keepKey[a] > keepKey[b] ? -1 : 1;
-    return (a > b) - (a < b);
-}
-
-static int comp_keep_best(int nIdx, long long cap, long long xlim)
-{
-    int *byKey = (int *)malloc(sizeof(int) * ((size_t)nIdx + 1)), i, n2 = 0;
-    char *keep = (char *)calloc((size_t)N + 1, 1);
-    long long tot = 0;
-    keepKey = (double *)malloc(sizeof(double) * ((size_t)N + 1));
-    if (!byKey || !keep || !keepKey) {          /* no memory: serve nobody */
-        for (i = 0; i < nIdx; i++) U[cmpIdx[i]].nopt = U[cmpIdx[i]].nbig = 0;
-        free(byKey); free(keep); free(keepKey); keepKey = 0;
-        return 0;
-    }
-    for (i = 0; i < nIdx; i++) {
-        const User *u = &U[cmpIdx[i]];
-        long long area = u->nopt > 0 ? u->minArea : (long long)u->optK[u->nopt] * S;
-        keepKey[cmpIdx[i]] = (double)u->profit / (double)(area > 0 ? area : 1);
-        byKey[i] = cmpIdx[i];
-    }
-    qsort(byKey, (size_t)nIdx, sizeof(int), cmp_keep);
-    for (i = 0; i < nIdx; i++) {
-        long long len = win_d(byKey[i]) - win_a(byKey[i]) + 1;
-        if (len > cap) len = cap;
-        if (tot + len + 1 > xlim) break;
-        tot += len + 1;
-        keep[byKey[i]] = 1;
-    }
-    for (i = 0; i < nIdx; i++) {
-        int id = cmpIdx[i];
-        if (keep[id]) cmpIdx[n2++] = id;
-        else U[id].nopt = U[id].nbig = 0;
-    }
-    free(byKey); free(keep); free(keepKey); keepKey = 0;
-    ops += (long long)nIdx * 40;
-    return n2;
-}
-
-static void compress_time(void)
-{
-    int i, nIdx = 0, sorted = 1, maxW2 = 1, nUsed = 0;
-    long long full, cap, xlim;
-    unsigned used = 0;
-    if (!oA) Xorig = X;
-    for (i = 0; i < nsh; i++) if (shW[i] > maxW2) maxW2 = shW[i];
-    for (i = 0; i < N; i++) {
-        int o2;
-        for (o2 = 0; o2 < U[i].nopt + U[i].nbig; o2++) used |= U[i].optShapes[o2];
-    }
-    for (i = 0; i < nsh; i++) if ((used >> i) & 1U) nUsed++;
-    /* columns the grid may have: memory for the occupancy and the free-start masks */
-    xlim = (long long)(MEM_GRID / ((double)(1 + nUsed) * W * 8.0)) - 4;
-    if (xlim > MAX_COLS) xlim = MAX_COLS;
-    cmpIdx = (int *)malloc(sizeof(int) * ((size_t)N + 1));
-    if (!cmpIdx) { comp_fail(); return; }
-    for (i = 0; i < N; i++) if (U[i].nopt + U[i].nbig > 0 && win_a(i) <= win_d(i)) cmpIdx[nIdx++] = i;
-    for (i = 1; i < nIdx; i++) if (win_a(cmpIdx[i]) < win_a(cmpIdx[i - 1])) sorted = 0;
-    if (!sorted) qsort(cmpIdx, (size_t)nIdx, sizeof(int), cmp_arr_idx);
-    full = comp_len(nIdx, Xorig + 1, 0);
-    cap = Xorig + 1;
-    if (full > xlim) {
-        long long lo = maxW2, hi = Xorig;       /* largest cap that fits */
-        while (lo < hi) {
-            long long md = lo + (hi - lo + 1) / 2;
-            if (comp_len(nIdx, md, 0) <= xlim) lo = md; else hi = md - 1;
-        }
-        cap = lo;
-        if (comp_len(nIdx, cap, 0) > xlim) nIdx = comp_keep_best(nIdx, cap, xlim);
-    } else if (!oA && full * 2 > X) {           /* little to gain: keep the axis */
-        free(cmpIdx); cmpIdx = 0;
-        return;
-    }
-    segO = (long long *)malloc(sizeof(long long) * ((size_t)nIdx + 1));
-    segC = (int *)malloc(sizeof(int) * ((size_t)nIdx + 1));
-    segL = (int *)malloc(sizeof(int) * ((size_t)nIdx + 1));
-    if (!segO || !segC || !segL) {
-        free(segO); free(segC); free(segL); segO = 0; segC = segL = 0; free(cmpIdx); cmpIdx = 0;
-        comp_fail();
-        return;
-    }
-    {
-        long long newX = comp_len(nIdx, cap, 1);
-        for (i = 0; i < N; i++) {
-            User *u = &U[i];
-            long long a = win_a(i), e = win_d(i);
-            if (u->nopt + u->nbig > 0 && a <= e && e - a + 1 > cap) e = a + cap - 1;
-            u->arr = comp_map(a);
-            u->dl = comp_map(e);
-        }
-        free(oA); free(oD); oA = oD = 0;
-        X = (int)(newX < 1 ? 1 : newX);
-    }
-    free(cmpIdx); cmpIdx = 0;
-    ops += (long long)N * 40;
-}
-
-/* ---------- setup ---------- */
-
-static void build_shapes(void)
-{
-    int hs[MAXSH * 4], nh = 0, i, j;
-    long long d;
-    nsh = 0;
-    if (S <= 0) return;
-    for (d = 1; d * d <= S; d++) {
-        if (S % d) continue;
-        if (nh < MAXSH * 4) hs[nh++] = (int)d;
-        if (d * d != S && nh < MAXSH * 4) hs[nh++] = (int)(S / d);
-    }
-    qsort(hs, (size_t)nh, sizeof(int), cmp_int);
-    for (i = 0; i < nh && nsh < MAXSH; i++) {
-        int h = hs[i], w = S / h;
-        if (h > Y || w > X) continue;
-        shH[nsh] = h; shW[nsh] = w; nsh++;
-    }
-    {
-        int mw = 1;
-        for (i = 0; i < nsh; i++) if (shW[i] > mw) mw = shW[i];
-        levCnt = ilog2(mw);                 /* former OR levels 1..log2(max width) */
-        levSpan = (1LL << (levCnt + 1)) - 2;
-        nlev = 1;                           /* occupancy only: no OR-level tables */
-    }
-    (void)j;
-    for (i = 0; i < nsh; i++) {
-        int len = 1;
-        shLj[i] = ilog2(shW[i]); shOff[i] = shW[i] - (1 << shLj[i]);
-        shNStep[i] = 0;
-        while (len < shH[i] && shNStep[i] < 40) {
-            int step = (len < shH[i] - len) ? len : shH[i] - len;
-            shStep[i][shNStep[i]++] = step;
-            len += step;
-        }
-    }
-}
-
-#ifdef DIAG
-static void lns_trace(long long lnsStart, int cycle)
-{
-    static int nextTr = 1;
-    if ((ops - lnsStart) * 20 >= (opsEnd - lnsStart) * nextTr) {
-        fprintf(stderr, "  lns %2d/20 profit=%lld area=%lld best=%lld steps=%lld lds=%d ta=%d thr=%.3g pass=%d | avg nr=%.1f nc=%.1f na=%.1f imp=%lld eq=%lld worse=%lld\n",
-                nextTr, curProfit, curArea, saOn ? bestP : curProfit, lnsSteps, ldsOn, saOn, saThr, cycle,
-                (double)dgNr / (dgSteps + 1e-9), (double)dgNc / (dgSteps + 1e-9), (double)dgNa / (dgSteps + 1e-9), dgImp, dgEq, dgWorse);
-        nextTr++;
-    }
-}
-#endif
-
-#ifndef TA_T0
 #define TA_T0 0.05      /* first threshold, in average profits of an accepted request */
-#endif
 static long long saStart, saStep;   /* start of the threshold phase, its steps */
 static double saThr0;
 static const double saAlphaTab[7] = {1.0, 0.6, 1.4, 0.8, 1.2, 0.7, 1.6};
 
 /* start of the threshold phase; returns 0 if it cannot start (no memory) */
-static int sa_begin(void)
-{
+static int sa_begin(void) {
     long long nAss = 0;
     int i;
     lpU = (float *)malloc(sizeof(float) * ((size_t)N + 1));
@@ -2836,8 +2593,7 @@ static int sa_begin(void)
 
 /* before each refill of the threshold phase: threshold (falling linearly to
    zero over the rest of the budget) and the next refill order in the cycle */
-static void sa_next(void)
-{
+static void sa_next(void) {
     double left = opsEnd > saStart ? (double)(opsEnd - ops) / (double)(opsEnd - saStart) : 0;
     saThr = left > 0 ? saThr0 * left : 0;
     saAlpha = saAlphaTab[saStep % 7];
@@ -2846,13 +2602,11 @@ static void sa_next(void)
 }
 
 /* end of the threshold phase: the answer is the best solution seen */
-static void sa_end(void)
-{
+static void sa_end(void) {
     if (!bestIsCur && snapP >= 0) snapOut = 1;
-#ifdef DIAG
-    fprintf(stderr, "  threshold phase end: current %lld best %lld snapOut %d\n", curProfit, bestP, snapOut);
-#endif
 }
+
+/* ---------- region sweep ---------- */
 
 /*
  * Adaptive sweep.  A class is a region shape (row band height, strip width);
@@ -2862,19 +2616,10 @@ static void sa_end(void)
  * each gained per unit of work recently (smooth weighted round-robin; every
  * class keeps a small share).
  */
-#ifndef SEG_DIV
 #define SEG_DIV 800                 /* a segment is about 1/SEG_DIV of the search budget */
-#endif
-#define NCLS 64
-#ifndef NARROW
-#define NARROW 1
-#endif
-#ifndef MIN_BAND
-#define MIN_BAND 8                  /* thinnest extra row band */
-#endif
-#ifndef CLS_FLOOR
-#define CLS_FLOOR 0.05
-#endif
+#define NCLS 64                     /* most classes                          */
+#define MIN_BAND 8                  /* thinnest extra row band               */
+#define CLS_FLOOR 0.05              /* every class keeps this share of the best rate */
 typedef struct {
     int mode, hb, rstep, pass, seen;
     long long wd, step, t0, r0;
@@ -2884,8 +2629,7 @@ typedef struct {
 static Cls cls[NCLS];
 static int ncls;
 
-static void cls_init(const int *widths, int nw)
-{
+static void cls_init(const int *widths, int nw) {
     int mode, wi;
     ncls = 0;
     /* row bands Y, Y/2, Y/4, and on tall grids thinner ones down to MIN_BAND rows */
@@ -2912,8 +2656,7 @@ static void cls_init(const int *widths, int nw)
 }
 
 /* one refill at the cursor of class c, then move the cursor */
-static void cls_step(Cls *c, int v)
-{
+static void cls_step(Cls *c, int v) {
     long long s0 = c->t0 < 0 ? 0 : c->t0, s1 = c->t0 + c->wd - 1;
     if (s1 > X - 1) s1 = X - 1;
     if (s1 >= s0) {
@@ -2930,8 +2673,7 @@ static void cls_step(Cls *c, int v)
     }
 }
 
-static int cls_pick(void)
-{
+static int cls_pick(void) {
     double tot = 0, mx = 0;
     int i, best = 0;
     for (i = 0; i < ncls; i++) if (!cls[i].seen) return i;     /* every class once, in order */
@@ -2947,8 +2689,7 @@ static int cls_pick(void)
 }
 
 /* the sweep until the budget ends (the threshold phase starts on the way) */
-static void lns_sweep(void)
-{
+static void lns_sweep(void) {
     int nv = nVar < NVAR_LNS ? nVar : NVAR_LNS;
     long long vc = 0;
     while (ops < opsEnd) {
@@ -2961,9 +2702,6 @@ static void lns_sweep(void)
             if (saOn) sa_next();
             cls_step(c, (int)(vc++ % nv));
             lns_check();
-#ifdef DIAG
-            lns_trace(lnsStart, c->pass);
-#endif
             if (!saOn && is_stalled()) {
                 stalled();
                 if (saOn && !sa_begin()) { saOn = 0; saAllowed = 0; }   /* no memory: plain sweep */
@@ -2975,48 +2713,28 @@ static void lns_sweep(void)
     }
 }
 
-int main(void)
-{
-    long long t, hdr[4];
-    int i, y, v, maxK = 1;
-    long long *bits;
+/* ---------- main program ---------- */
 
-    for (i = 0; i < 4; i++) if (!read_ll(&hdr[i])) { print_empty(); return 0; }
+static u64 *xrow(void) { return (u64 *)xcalloc((size_t)W, sizeof(u64)); }   /* W-word scratch */
+
+/* read the header and every user (options built on the fly); 0: nothing to serve */
+static int read_input(int *maxK) {
+    long long t, hdr[4], *bits;
+    int i, y, v;
+    double mo;
+    for (i = 0; i < 4; i++) if (!read_ll(&hdr[i])) return 0;
     if (hdr[0] <= 0 || hdr[1] <= 0 || hdr[2] <= 0 || hdr[3] <= 0 ||
-        hdr[0] > 2000000000LL || hdr[2] > 2000000000LL) {
-        /* still consume nothing more: no user can be served */
-        print_empty();
-        return 0;
-    }
+        hdr[0] > 2000000000LL || hdr[2] > 2000000000LL) return 0;
     Y = (int)hdr[0]; S = (int)hdr[2];
     Xorig = hdr[1];
     X = hdr[1] > 2000000000LL ? 2000000000 : (int)hdr[1];   /* longer axes are compressed */
     N = hdr[3] > 100000000LL ? 100000000 : (int)hdr[3];
     W = (int)(((long long)Y + 63) / 64);
-
-    scT = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scRm1 = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scRm2 = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scOcc = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scFr = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scSl = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scSr = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scCand = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scG = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scM = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scPend = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scTail = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scBig1 = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scBig2 = (u64 *)xcalloc((size_t)W, sizeof(u64));
-    scSm = (u64 *)xcalloc((size_t)W, sizeof(u64));
-
+    scT = xrow(); scRm1 = xrow(); scRm2 = xrow(); scFr = xrow(); scG = xrow(); scM = xrow();
+    scPend = xrow(); scTail = xrow(); scBig1 = xrow(); scBig2 = xrow(); scSm = xrow();
     build_shapes();
-
-    {
-        double per = ((double)N + 1.0) * W * 8.0;
-        double mo = MEM_OPT / per;
-        maxOpt = mo >= 8.0 ? 8 : (mo < 2.0 ? 2 : (int)mo);
-    }
+    mo = MEM_OPT / (((double)N + 1.0) * W * 8.0);     /* option masks per user that fit */
+    maxOpt = mo >= 8.0 ? 8 : (mo < 2.0 ? 2 : (int)mo);
     tK = (int *)xmalloc(sizeof(int) * (size_t)(maxOpt + 3));
     tMask = (u64 *)xcalloc((size_t)(maxOpt + 3) * W, sizeof(u64));
     tSh = (unsigned *)xcalloc((size_t)(maxOpt + 3), sizeof(unsigned));
@@ -3050,82 +2768,81 @@ int main(void)
             u->dl = clamp_int(t);
         }
         build_options(u, bits);
-        for (v = 0; v < u->nopt + u->nbig; v++) if (u->optK[v] > maxK) maxK = u->optK[v];
+        for (v = 0; v < u->nopt + u->nbig; v++) if (u->optK[v] > *maxK) *maxK = u->optK[v];
     }
-    compress_time();
-    unsortedArr = 0;
-    for (i = 1; i < N; i++) if (U[i].arr < U[i - 1].arr) unsortedArr = 1;
+    return 1;
+}
 
+/* grid structures and per-placement scratch (sized from the input) */
+static void alloc_grid(int maxK) {
+    int i, q;
+    double per = 0, tot;
     if (nsh > 0) {
-        for (i = 0; i < nlev; i++) lev[i] = (u64 *)xcalloc((size_t)X * W + 1, sizeof(u64));
-        col = lev[0];
+        col = (u64 *)xcalloc((size_t)X * W + 1, sizeof(u64));
         for (i = 0; i < nsh; i++) if (shW[i] > maxShW) maxShW = shW[i];
-{
-            /* journal bound: every free-start word, column flag and summary word
-               one RB can change, times the most RBs one request can hold */
-            double per = 0, tot;
-            int q;
-            for (q = 0; q < nsh; q++) per += ((double)shW[q] + maxShW) * (W + 1) + ((double)shW[q] + maxShW) / 64.0 + 4;
-            tot = per * (MAX_RB + 1);       /* bigger requests: undo by recomputing */
-            if (tot * 16.0 <= 256e6) {
-                jCap = (long long)tot + 64;
-                jPtr = (u64 **)malloc(sizeof(u64 *) * (size_t)jCap);
-                jVal = (u64 *)malloc(sizeof(u64) * (size_t)jCap);
-                if (!jPtr || !jVal) { free(jPtr); free(jVal); jPtr = 0; jVal = 0; jCap = 0; }
-            }
+        /* journal bound: every free-start word, column flag and summary word
+           one RB can change, times the most RBs one request can hold */
+        for (q = 0; q < nsh; q++) per += ((double)shW[q] + maxShW) * (W + 1) + ((double)shW[q] + maxShW) / 64.0 + 4;
+        tot = per * (MAX_RB + 1);       /* bigger requests: undo by recomputing */
+        if (tot * 16.0 <= 256e6) {
+            jCap = (long long)tot + 64;
+            jPtr = (u64 **)malloc(sizeof(u64 *) * (size_t)jCap);
+            jVal = (u64 *)malloc(sizeof(u64) * (size_t)jCap);
+            if (!jPtr || !jVal) { free(jPtr); free(jVal); jPtr = 0; jVal = 0; jCap = 0; }
         }
         vhP = (u64 *)xcalloc((size_t)(3 * maxShW + 64) * W, sizeof(u64));
         vhS = (u64 *)xcalloc((size_t)(3 * maxShW + 64) * W, sizeof(u64));
         fzWords = X / 64 + 2;
         usedSh = 0;
-        for (i = 0; i < N; i++) {
-            int o2;
-            for (o2 = 0; o2 < U[i].nopt + U[i].nbig; o2++) usedSh |= U[i].optShapes[o2];
-        }
-        for (;;) {                              /* masks must fit in memory */
-            int q, nU = 0;
+        for (i = 0; i < N; i++)
+            for (q = 0; q < U[i].nopt + U[i].nbig; q++) usedSh |= U[i].optShapes[q];
+        for (;;) {                              /* masks must fit in memory: drop the widest */
+            int nU = 0;
             for (q = 0; q < nsh; q++) if ((usedSh >> q) & 1U) nU++;
             if ((double)(1 + nU) * ((double)X + 2) * W * 8.0 <= MEM_GRID || nU <= 1) break;
-            for (q = 0; q < nsh; q++) if ((usedSh >> q) & 1U) { usedSh &= ~(1U << q); break; }   /* widest */
+            for (q = 0; q < nsh; q++) if ((usedSh >> q) & 1U) { usedSh &= ~(1U << q); break; }
         }
-        for (i = 0; i < N; i++) {
-            int o2;
-            for (o2 = 0; o2 < U[i].nopt + U[i].nbig; o2++) U[i].optShapes[o2] &= usedSh;
-        }
-        for (i = 0; i < nsh; i++) fz[i] = (u64 *)xcalloc(((usedSh >> i) & 1U) ? (size_t)fzWords : 1, sizeof(u64));
+        for (i = 0; i < N; i++)
+            for (q = 0; q < U[i].nopt + U[i].nbig; q++) U[i].optShapes[q] &= usedSh;
         fzsWords = fzWords / 64 + 2;
-        for (i = 0; i < nsh; i++) fzs[i] = (u64 *)xcalloc(((usedSh >> i) & 1U) ? (size_t)fzsWords : 1, sizeof(u64));
-        for (i = 0; i < nsh; i++) fm[i] = (u64 *)xcalloc(((usedSh >> i) & 1U) ? ((size_t)X + 1) * W : 1, sizeof(u64));
-        scGs = (u64 *)xcalloc((size_t)W, sizeof(u64));
+        for (i = 0; i < nsh; i++) {
+            int on = (usedSh >> i) & 1U;
+            fz[i] = (u64 *)xcalloc(on ? (size_t)fzWords : 1, sizeof(u64));
+            fzs[i] = (u64 *)xcalloc(on ? (size_t)fzsWords : 1, sizeof(u64));
+            fm[i] = (u64 *)xcalloc(on ? ((size_t)X + 1) * W : 1, sizeof(u64));
+        }
+        scGs = xrow();
         nBlk = X / 64 + 1;
         fen = (long long *)xcalloc((size_t)nBlk + 2, sizeof(long long));
         useRow = (double)Y * fzWords * 8.0 <= MEM_ROW;
         if (useRow) rowOcc = (u64 *)xcalloc((size_t)Y * fzWords, sizeof(u64));
         useOwn = (double)X * Y * 4.0 <= MEM_OWN;
         if (useOwn) own = (int *)xmalloc(sizeof(int) * (size_t)X * Y);
-        scAll = (u64 *)xcalloc((size_t)W, sizeof(u64));
-        scMp = (u64 *)xcalloc((size_t)W, sizeof(u64));
-        scMn = (u64 *)xcalloc((size_t)W, sizeof(u64));
-        scMm = (u64 *)xcalloc((size_t)W, sizeof(u64));
+        scAll = xrow(); scMp = xrow(); scMn = xrow(); scMm = xrow();
         row_mask(scAll, 0, Y);
     }
     tmpRB = (RB *)xmalloc(sizeof(RB) * (size_t)maxK);
     tmpJ = (long long *)xmalloc(sizeof(long long) * ((size_t)maxK + 2));
     dryRB = (RB *)xmalloc(sizeof(RB) * (size_t)maxK);
+    mixA = (RB *)xmalloc(sizeof(RB) * (size_t)maxK);
     tmpUn = (RB *)xmalloc(sizeof(RB) * (size_t)maxK);
     unOpen = (int *)xmalloc(sizeof(int) * ((size_t)Y + 1));
     unStamp = (int *)xcalloc((size_t)Y + 1, sizeof(int));
-    scRowsU = (u64 *)xcalloc((size_t)W, sizeof(u64));
+    scRowsU = xrow();
     dryCap = maxK + 1;
     if ((double)dryCap * W > 4e6) dryCap = (int)(4e6 / W) + 1;
     dryQx = (int *)xmalloc(sizeof(int) * (size_t)dryCap);
     dryQ = (u64 *)xmalloc(sizeof(u64) * (size_t)dryCap * W);
-    dryB = (u64 *)xcalloc((size_t)W, sizeof(u64));
+    dryB = xrow();
+}
+
+/* priority orders, the list of big requests, load and cost factors */
+static void build_orders(void) {
+    int i, v;
+    double dem = 0;
     keyBuf = (double *)xmalloc(sizeof(double) * ((size_t)N + 1));
     rsA = (KeyId *)xmalloc(sizeof(KeyId) * ((size_t)N + 1));
     rsB = (KeyId *)xmalloc(sizeof(KeyId) * ((size_t)N + 1));
-
-
     nVar = N > 300000 ? 1 : NVAR;   /* sorting several orders of a huge input costs too much */
     for (i = 0; i < N; i++) if (U[i].nopt && U[i].dl - U[i].arr + 1 > maxWin) maxWin = U[i].dl - U[i].arr + 1;
     for (v = 0; v < nVar; v++) {
@@ -3134,8 +2851,8 @@ int main(void)
         radix_order(order[v]);
     }
     free(keyBuf); free(rsA); free(rsB); keyBuf = 0; rsA = rsB = 0;
-    /* requests that can only use more than MAX_RB RBs (or whose normal options
-       all fail): tried last, by profit per area of their smallest such option */
+    /* requests that can only use more than MAX_RB RBs: tried by the profit per
+       area of their smallest such option */
     for (i = 0; i < N; i++) if (U[i].nbig > 0) nBig++;
     if (nBig > 0) {
         BigKey *bk = (BigKey *)malloc(sizeof(BigKey) * (size_t)nBig);
@@ -3158,202 +2875,181 @@ int main(void)
             ops += (long long)nBig * 40;
         }
     }
-    {   /* how oversubscribed the grid is */
-        double dem = 0;
-        for (i = 0; i < N; i++) if (U[i].nopt > 0) dem += (double)U[i].minArea;
-        loadRatio = dem / ((double)X * Y);
-    }
+    /* how oversubscribed the grid is */
+    for (i = 0; i < N; i++) if (U[i].nopt > 0) dem += (double)U[i].minArea;
+    loadRatio = dem / ((double)X * Y);
     consExtra = CONS_N * (N < 200000 ? (double)N / 200000.0 : 1.0) + CONS_W * ilog2(W);
     /* account for reading, option building and sorting */
     ops += inTotal * SETUP_PER_BYTE + (long long)N * nVar * 60;
+}
 
+/*
+ * Constructions (budgets are counted from the end of the setup):
+ *   0. lookahead LOOK_MUL, switching to the cheap mode when needed;
+ *   1. if it switched and budget is left: the planned pass;
+ *   2. 3. wider lookaheads while the budget allows.
+ * The best one is kept.  Sets opsEnd for the local search.
+ */
+static void construct(void) {
+    static const int cfgL[] = {LOOK_MUL, LOOK_MUL, 32, 96};
+    static const int cfgMode[] = {GR_TRY, GR_PLANNED, GR_PLAIN, GR_PLAIN};
+    long long base = ops, rest = OPS_LIMIT - ops, gBudget, normRest, normEnd, wideRest, wideEnd;
+    long long gP = -1, gA = 0, gEnd, prevCost = 0;
+    int nCfg = 4, ci, i, bestC = -1, lastC = -1, r, switched = 0, wideLook = 32, lnsWill;
+    if (rest < OPS_LIMIT / 3) rest = OPS_LIMIT / 3;   /* the greedy always gets a share */
+    gBudget = rest * 97 / 100;
+    gEnd = base + gBudget;
+    /* extra constructions and the local search stay within the normal budget */
+    normRest = NORM_LIMIT - ops;
+    if (normRest < NORM_LIMIT / 3) normRest = NORM_LIMIT / 3;
+    if (normRest > rest) normRest = rest;
+    normEnd = base + normRest;
+    /* a wider lookahead usually gains more than the local search: it may use
+       a little more than the normal budget */
+    wideRest = WIDE_LIMITV - ops;
+    if (wideRest < normRest) wideRest = normRest;
+    if (wideRest > rest) wideRest = rest;
+    wideEnd = base + wideRest;
+    hardLimit = base + rest + (OPS_HARD - OPS_LIMIT);
+    allProfit = 0;
+    for (i = 0; i < N; i++) if (U[i].nopt + U[i].nbig > 0) allProfit += U[i].profit;
+    ownLive = 0;                            /* only the local search needs owners */
+    for (ci = 0; ci < nCfg; ci++) {
+        long long st = ops;
+        if (ci == 1 && (!switched || !cpValid || ops + cpTot * 12 / 10 > gEnd)) continue;
+        if (ci == 2 && longWhole) continue;   /* the first one already had the long lookahead */
+        if (ci == 2) {
+            /* the widest lookahead whose cost (measured ratios, with a margin) fits */
+            static const int wl[] = {32, 16, 8};
+            static const int wf[] = {26, 19, 15};      /* tenths of the last cost */
+            int q, pick = -1;
+            if (switched) { if (ops + prevCost * 35 / 10 <= normEnd) pick = 0; }
+            else for (q = 0; q < 3 && pick < 0; q++) if (ops + prevCost * wf[q] / 10 <= wideEnd) pick = q;
+            if (pick < 0) break;
+            wideLook = wl[pick];
+        }
+        if (ci == 3 && ops + prevCost * 2 > normEnd) break;
+        lookMul = ci == 2 ? wideLook : cfgL[ci];
+        r = greedy(0, (ci == 2 ? wideEnd : ci == 3 ? normEnd : gEnd) - ops, cfgMode[ci]);
+        if (ci == 0) switched = greedySwitched;
+        prevCost = ops - st;
+        lastC = ci;
+        if (curProfit > gP || (curProfit == gP && curArea < gA)) {
+            gP = curProfit; gA = curArea; bestC = ci;
+            if (ci + 1 < nCfg) save_snapshot();
+        }
+        if (!r) break;                      /* out of budget */
+        if (curProfit >= allProfit) break;  /* everybody is served */
+    }
+    lnsWill = ops < normEnd;                /* a local search follows */
+    if (bestC >= 0 && bestC != lastC) {
+        if (snapP >= 0 && !lnsWill) snapOut = 1;           /* the answer is the snapshot */
+        else if (snapP >= 0) restore_snapshot();
+        else { lookMul = bestC == 2 ? wideLook : cfgL[bestC]; greedy(0, gBudget, GR_PLAIN); }
+    }
+    ownLive = 1;
+    if (useOwn && !snapOut && lnsWill) rebuild_owner();
+    lookMul = LNS_LOOK;
+    opsEnd = normEnd;
+    hardLimit = normEnd + (OPS_HARD - OPS_LIMIT) / 4;
+    if (hardLimit < ops) hardLimit = ops;
+}
+
+/* ruin and recreate until opsEnd (region widths from the average window) */
+static void local_search(void) {
+    int widths[12], nw = 0, i, v, ok = 1, c, nc0;
+    long long sumL = 0, cntL = 0, Lavg, cand[10], nAs = 0, maxW;
+    if (ops < opsEnd && shDirty) refresh_dirty();
+    if (ops >= opsEnd) return;
+    candList = (int *)malloc(sizeof(int) * ((size_t)N + 64));
+    addList = (int *)malloc(sizeof(int) * ((size_t)N + 64));
+    remList = (int *)malloc(sizeof(int) * ((size_t)N + 1));
+    remStart = (int *)malloc(sizeof(int) * ((size_t)N + 1));
+    remCnt = (int *)malloc(sizeof(int) * ((size_t)N + 1));
+    inRem = (char *)calloc((size_t)N + 1, 1);
+    if (!candList || !addList || !remList || !remStart || !remCnt || !inRem) ok = 0;
+    for (v = 0; v < nVar && ok; v++) {
+        ulist[v] = (int *)malloc(sizeof(int) * ((size_t)N + 1));
+        rankv[v] = (int *)malloc(sizeof(int) * ((size_t)N + 1));
+        if (!ulist[v] || !rankv[v]) ok = 0;
+        else for (i = 0; i < N; i++) rankv[v][order[v][i]] = i;
+    }
+    if (!ok) { opsEnd = ops; return; }      /* not enough memory: no local search */
+    for (i = 0; i < N; i++) if (U[i].nopt) { sumL += U[i].dl - U[i].arr + 1; cntL++; }
+    Lavg = cntL ? sumL / cntL : X;
+    lnsLavg = Lavg > 0 ? Lavg : 1;
+    /* a full-height strip holds at most about REG_USERS average requests */
+    for (i = 0; i < N; i++) nAs += U[i].assigned;
+    maxW = nAs > 0 ? (long long)((double)REG_USERS * ((double)curArea / (double)nAs) / (double)Y) : X;
+    if (maxW < 2LL * S) maxW = 2LL * S;
+    ops += N;
+    cand[0] = Lavg / 8; cand[1] = Lavg / 4; cand[2] = Lavg / 2;
+    cand[3] = Lavg; cand[4] = 2LL * S; cand[5] = S;
+    cand[6] = maxW / 4; cand[7] = maxW / 2;     /* only if some width was cut */
+    nc0 = 6;
+    for (c = 0; c < 6; c++) if (cand[c] > maxW) { cand[c] = maxW; nc0 = 8; }
+    cand[nc0++] = S / 2; cand[nc0++] = S / 4;   /* narrow strips */
+    for (c = 0; c < nc0; c++) {
+        long long w = cand[c];
+        int dup = 0, q2;
+        if (w < 2) w = 2;
+        if (w > X) w = X;
+        for (q2 = 0; q2 < nw; q2++) if (widths[q2] == w) dup = 1;
+        if (!dup) widths[nw++] = (int)w;
+    }
+    qsort(widths, (size_t)nw, sizeof(int), cmp_int);
+    lnsStart = ops;
+    lastImpOps = ops; lastImpStep = lnsSteps;
+    lnsStall = (opsEnd - lnsStart) / LDS_STALL;
+    cls_init(widths, nw);
+    lns_sweep();
+    if (saOn) sa_end();
+}
+
+/* answer: total profit, count, then every served user (by id) with its RBs */
+static void write_output(void) {
+    int i, r, na = 0, sorted = 1;
+    long long tot = 0;
+    if (!remList) remList = (int *)xmalloc(sizeof(int) * ((size_t)N + 1));
+    if (snapOut) {                          /* the answer is the kept construction */
+        for (i = 0; i < N; i++) {
+            U[i].assigned = snapA[i];
+            if (snapA[i]) { U[i].rbs = snapPool + snapStart[i]; U[i].nrb = snapCnt[i]; }
+        }
+    }
+    for (i = 0; i < N; i++) if (U[i].assigned) {
+        if (na > 0 && U[i].id <= U[remList[na - 1]].id) sorted = 0;
+        remList[na++] = i; tot += U[i].profit;
+    }
+    if (!sorted) qsort(remList, (size_t)na, sizeof(int), cmp_by_id);
+    outBuf = (char *)xmalloc(OUT_CAP);
+    out_ll(tot); out_c(' '); out_ll(na); out_c('\n');
+    for (i = 0; i < na; i++) {
+        User *u = &U[remList[i]];
+        out_room(48);
+        out_ll(u->id); out_c(' '); out_ll(u->nrb);
+        for (r = 0; r < u->nrb; r++) {
+            out_room(64);
+            out_c(' '); out_ll(u->rbs[r].h); out_c(' '); out_ll(u->rbs[r].w);
+            out_c(' '); out_ll(u->rbs[r].y); out_c(' '); out_ll(segO ? comp_unmap(u->rbs[r].x) : u->rbs[r].x);
+        }
+        out_c('\n');
+    }
+    out_flush();
+}
+
+int main(void) {
+    int i, maxK = 1;
+    if (!read_input(&maxK)) { print_empty(); return 0; }
+    compress_time();
+    unsortedArr = 0;
+    for (i = 1; i < N; i++) if (U[i].arr < U[i - 1].arr) unsortedArr = 1;
+    alloc_grid(maxK);
+    build_orders();
     if (nsh > 0) {
-        /* 1. initial greedy with each priority order */
-        /* budgets are counted from here, so a costly setup never starves the search */
-        long long opsLimit = OPS_LIMIT, normLimit = NORM_LIMIT, wideLimit = BUDGET(WIDE_LIMITV);
-        long long base = ops, rest = opsLimit - ops, gBudget, normRest, normEnd, cost0 = 0, wideRest, wideEnd;
-        /* portfolio of constructions: (priority order, lookahead); extra ones only while cheap */
-        /* constructions:
-             1. wide lookahead; if it is projected not to reach every request, the
-                remaining requests use first fit (cost profile recorded);
-             2. if it had to switch and budget is left: the planned pass (wide
-                lookahead for the leading requests while first fit can still reach
-                all the others, from the recorded profile);
-             3. wider lookaheads while the normal budget allows.
-           The best construction is kept. */
-        static const int cfgL[] = {LOOK_MUL, LOOK_MUL, 32, 96};
-        static const int cfgMode[] = {GR_TRY, GR_PLANNED, GR_PLAIN, GR_PLAIN};
-        int nCfg = (int)(sizeof(cfgL) / sizeof(cfgL[0])), ci, bestC = -1, lastC = -1, r, switched = 0, wideLook = 32, lnsWill;
-        long long gP = -1, gA = 0, gEnd, prevCost = 0;
-        if (rest < opsLimit / 3) rest = opsLimit / 3;   /* the greedy always gets a share */
-        gBudget = rest * 97 / 100;
-        gEnd = base + gBudget;
-        /* extra constructions and the local search stay within the normal budget */
-        normRest = normLimit - ops;
-        if (normRest < normLimit / 3) normRest = normLimit / 3;
-        if (normRest > rest) normRest = rest;
-        normEnd = base + normRest;
-        /* a wider lookahead usually gains far more than the local search: it may
-           use a little more than the normal budget */
-        wideRest = wideLimit - ops;
-        if (wideRest < normRest) wideRest = normRest;
-        if (wideRest > rest) wideRest = rest;
-        wideEnd = base + wideRest;
-        hardLimit = base + rest + (OPS_HARD - OPS_LIMIT);
-        allProfit = 0;
-        for (i = 0; i < N; i++) if (U[i].nopt + U[i].nbig > 0) allProfit += U[i].profit;
-        ownLive = 0;                            /* only the local search needs owners */
-        ownValid = 0;
-        for (ci = 0; ci < nCfg; ci++) {
-            long long st = ops;
-            if (ci == 1 && (!switched || !cpValid || ops + cpTot * 12 / 10 > gEnd)) continue;
-            if (ci == 2 && longWhole) continue;   /* the first one already had the long lookahead */
-#ifdef NO_WIDE
-            if (ci >= 2) break;
-#endif
-            if (ci == 2) {
-                /* the widest lookahead whose cost (measured ratios to lookahead 4,
-                   with a margin) still fits */
-                static const int wl[] = {32, 16, 8};
-                static const int wf[] = {26, 19, 15};      /* tenths of the last cost */
-                int q, pick = -1;
-                if (switched) { if (ops + prevCost * 35 / 10 <= normEnd) pick = 0; }
-                else for (q = 0; q < 3 && pick < 0; q++) if (ops + prevCost * wf[q] / 10 <= wideEnd) pick = q;
-                if (pick < 0) break;
-                wideLook = wl[pick];
-            }
-            if (ci == 3 && ops + prevCost * 2 > normEnd) break;
-            lookMul = ci == 2 ? wideLook : cfgL[ci];
-            r = greedy(0, (ci == 2 ? wideEnd : ci == 3 ? normEnd : gEnd) - ops, cfgMode[ci]);
-            if (ci == 0) switched = greedySwitched;
-#ifdef DIAG
-            fprintf(stderr, "  config %d look=%d mode=%d complete=%d switched=%d profit=%lld cost=%.3g ops=%.3g\n", ci, cfgL[ci], cfgMode[ci], r, greedySwitched, curProfit, (double)(ops - st), (double)ops);
-#endif
-            prevCost = ops - st;
-            lastC = ci;
-            if (curProfit > gP || (curProfit == gP && curArea < gA)) {
-                gP = curProfit; gA = curArea; bestC = ci;
-                if (ci + 1 < nCfg) save_snapshot();
-            }
-            if (!r) break;                      /* out of budget */
-            if (curProfit >= allProfit) break;  /* everybody is served */
-        }
-        lnsWill = ops < normEnd;                /* a local search follows */
-        if (bestC >= 0 && bestC != lastC) {
-            if (snapP >= 0 && !lnsWill) snapOut = 1;           /* no local search follows */
-            else if (snapP >= 0) restore_snapshot();
-            else { lookMul = bestC == 2 ? wideLook : cfgL[bestC]; greedy(0, gBudget, GR_PLAIN); }
-        }
-        ownLive = 1;
-        if (useOwn && !snapOut && lnsWill) { rebuild_owner(); ownValid = 1; }
-        lookMul = LNS_LOOK;
-        opsEnd = normEnd;
-        hardLimit = normEnd + (OPS_HARD - OPS_LIMIT) / 4;
-        if (hardLimit < ops) hardLimit = ops;
-        (void)cost0;
-
-        /* 2. ruin and recreate over systematic strips / bands */
-        if (ops < opsEnd && shDirty) refresh_dirty();
-        if (ops < opsEnd) {
-            int ok = 1;
-            candList = (int *)malloc(sizeof(int) * ((size_t)N + 64));
-            addList = (int *)malloc(sizeof(int) * ((size_t)N + 64));
-            remList = (int *)malloc(sizeof(int) * ((size_t)N + 1));
-            remStart = (int *)malloc(sizeof(int) * ((size_t)N + 1));
-            remCnt = (int *)malloc(sizeof(int) * ((size_t)N + 1));
-            inRem = (char *)calloc((size_t)N + 1, 1);
-            if (!candList || !addList || !remList || !remStart || !remCnt || !inRem) ok = 0;
-            for (v = 0; v < nVar && ok; v++) {
-                ulist[v] = (int *)malloc(sizeof(int) * ((size_t)N + 1));
-                rankv[v] = (int *)malloc(sizeof(int) * ((size_t)N + 1));
-                if (!ulist[v] || !rankv[v]) ok = 0;
-                else for (i = 0; i < N; i++) rankv[v][order[v][i]] = i;
-            }
-            if (!ok) opsEnd = ops;                  /* not enough memory: no local search */
-        }
-        if (ops < opsEnd)
-        {
-            int widths[12], nw = 0;
-            long long sumL = 0, cntL = 0, Lavg;
-            for (i = 0; i < N; i++) if (U[i].nopt) { sumL += U[i].dl - U[i].arr + 1; cntL++; }
-            Lavg = cntL ? sumL / cntL : X;
-            lnsLavg = Lavg > 0 ? Lavg : 1;
-            {
-                long long cand[10], nAs = 0, maxW;
-                int c, nc0;
-                /* a full-height strip holds at most about REG_USERS average requests */
-                for (i = 0; i < N; i++) nAs += U[i].assigned;
-                maxW = nAs > 0 ? (long long)((double)REG_USERS * ((double)curArea / (double)nAs) / (double)Y) : X;
-                if (maxW < 2LL * S) maxW = 2LL * S;
-                ops += N;
-                cand[0] = Lavg / 8; cand[1] = Lavg / 4; cand[2] = Lavg / 2;
-                cand[3] = Lavg; cand[4] = 2LL * S; cand[5] = S;
-                cand[6] = maxW / 4; cand[7] = maxW / 2;     /* only if some width was cut */
-                nc0 = 6;
-                for (c = 0; c < 6; c++) if (cand[c] > maxW) { cand[c] = maxW; nc0 = 8; }
-                if (NARROW) { cand[nc0++] = S / 2; cand[nc0++] = S / 4; }   /* narrow strips */
-                for (c = 0; c < nc0; c++) {
-                    long long w = cand[c];
-                    int dup = 0, q2;
-                    if (w < 2) w = 2;
-                    if (w > X) w = X;
-                    for (q2 = 0; q2 < nw; q2++) if (widths[q2] == w) dup = 1;
-                    if (!dup) widths[nw++] = (int)w;
-                }
-                qsort(widths, (size_t)nw, sizeof(int), cmp_int);
-            }
-            lnsStart = ops;
-            lastImpOps = ops; lastImpStep = lnsSteps;
-            lnsStall = (opsEnd - lnsStart) / LDS_STALL;
-            cls_init(widths, nw);
-            lns_sweep();
-            if (saOn) sa_end();
-        }
+        construct();
+        local_search();
     }
-
-    /* 3. output (sorted by user id; hand-formatted, buffered) */
-    {
-        int na = 0, sorted = 1;
-        long long tot = 0;
-        if (!remList) remList = (int *)xmalloc(sizeof(int) * ((size_t)N + 1));
-        if (snapOut) {                      /* answer = kept construction */
-            for (i = 0; i < N; i++) {
-                U[i].assigned = snapA[i];
-                if (snapA[i]) { U[i].rbs = snapPool + snapStart[i]; U[i].nrb = snapCnt[i]; }
-            }
-        }
-        for (i = 0; i < N; i++) if (U[i].assigned) {
-            if (na > 0 && U[i].id <= U[remList[na - 1]].id) sorted = 0;
-            remList[na++] = i; tot += U[i].profit;
-        }
-        if (!sorted) qsort(remList, (size_t)na, sizeof(int), cmp_by_id);
-        outBuf = (char *)malloc(OUT_CAP);
-        if (!outBuf) {
-            printf("%lld %d\n", tot, na);
-            for (i = 0; i < na; i++) {
-                User *u = &U[remList[i]];
-                int r;
-                printf("%lld %d", u->id, u->nrb);
-                for (r = 0; r < u->nrb; r++)
-                    printf(" %d %d %d %lld", u->rbs[r].h, u->rbs[r].w, u->rbs[r].y, segO ? comp_unmap(u->rbs[r].x) : (long long)u->rbs[r].x);
-                printf("\n");
-            }
-        } else {
-            out_ll(tot); out_c(' '); out_ll(na); out_c('\n');
-            for (i = 0; i < na; i++) {
-                User *u = &U[remList[i]];
-                int r;
-                out_room(48);
-                out_ll(u->id); out_c(' '); out_ll(u->nrb);
-                for (r = 0; r < u->nrb; r++) {
-                    out_room(64);
-                    out_c(' '); out_ll(u->rbs[r].h); out_c(' '); out_ll(u->rbs[r].w);
-                    out_c(' '); out_ll(u->rbs[r].y); out_c(' '); out_ll(segO ? comp_unmap(u->rbs[r].x) : u->rbs[r].x);
-                }
-                out_c('\n');
-            }
-            out_flush();
-        }
-    }
+    write_output();
     return 0;
 }
