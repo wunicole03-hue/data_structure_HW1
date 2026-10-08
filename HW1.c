@@ -514,7 +514,8 @@ static void remove_user(int u) {
 /* ------------------------------------------------------------------ */
 /* Placement of one user                                              */
 /* ------------------------------------------------------------------ */
-static int *trY, *trX, *bsY, *bsX;  /* trial / best positions */
+static int *trY, *trX, *bsY, *bsX, *bsS;    /* trial / best positions */
+static int trialPlaced;             /* blocks the last trial could place */
 /* placement effort: lookahead (RB widths), spots scored per RB, options and
    whether the first shape that fits is taken */
 static int lookMul = LA_MUL, maxEval = MAXEVAL, maxOpt = MAXOPT, firstShape = 0;
@@ -527,7 +528,8 @@ static void ensure_pos(int k) {
     trX = realloc(trX, sizeof(int) * posCap);
     bsY = realloc(bsY, sizeof(int) * posCap);
     bsX = realloc(bsX, sizeof(int) * posCap);
-    if (!trY || !trX || !bsY || !bsX) exit(1);
+    bsS = realloc(bsS, sizeof(int) * posCap);
+    if (!trY || !trX || !bsY || !bsX || !bsS) exit(1);
 }
 
 /*
@@ -567,7 +569,43 @@ static ll trial(int s, int k, const u64 *M, int ca, int cb) {
         sum += bestC;
     }
     for (j = 0; j < r; j++) set_rect(trY[j], trX[j], s, 0);
+    trialPlaced = r;
     return r == k ? sum : -1;
+}
+
+#ifndef MIXED
+#define MIXED 1
+#endif
+/*
+ * Two shapes for one user: the r1 blocks of shape s1 that fit, then the
+ * other k - r1 blocks with another shape strictly after (or before) them in
+ * time, so blocks of different shapes never overlap in time.  On success
+ * the positions are in bsY / bsX and bsS; returns 1.
+ */
+static int trial_mixed(int s1, int r1, int k, const u64 *M, int run, int ca, int cb) {
+    int i, s2, lo = cb, hi = ca, ok = 0;
+    if (trial(s1, r1, M, ca, cb) < 0) return 0;
+    for (i = 0; i < r1; i++) {
+        bsY[i] = trY[i]; bsX[i] = trX[i]; bsS[i] = s1;
+        if (trX[i] < lo) lo = trX[i];
+        if (trX[i] + shW[s1] - 1 > hi) hi = trX[i] + shW[s1] - 1;
+        set_rect(trY[i], trX[i], s1, 1);
+    }
+    for (s2 = 0; s2 < nsh && !ok; s2++) {
+        int side;
+        if (s2 == s1 || shH[s2] > run) continue;
+        for (side = 0; side < 2 && !ok; side++) {
+            int a = side ? ca : hi + 1, b = side ? lo - 1 : cb;
+            if (b - a + 1 < shW[s2]) continue;
+            OPS(K_TRIAL, 1);
+            if (trial(s2, k - r1, M, a, b) >= 0) {
+                for (i = r1; i < k; i++) { bsY[i] = trY[i - r1]; bsX[i] = trX[i - r1]; bsS[i] = s2; }
+                ok = 1;
+            }
+        }
+    }
+    for (i = 0; i < r1; i++) set_rect(bsY[i], bsX[i], s1, 0);
+    return ok;
 }
 
 /* Places user u inside columns [ca, cb] (already within its window). */
@@ -579,7 +617,7 @@ static int place_user(int u, int ca, int cb) {
     freeCells = fen_sum(cb + 1) - fen_sum(ca);
     OPS(5, 1);
     for (o = p->o0; o < p->o0 + p->no && o < p->o0 + maxOpt; o++) {
-        int k = oK[o], bestS = -1, r;
+        int k = oK[o], bestS = -1, r, partS = -1, partR = 0;
         ll bestNum = 0, bestDen = 1;
         const u64 *M = oMask + (size_t)o * W;
         if ((ll)k * S > freeCells) break;   /* later options need even more */
@@ -589,7 +627,10 @@ static int place_user(int u, int ca, int cb) {
             if (shW[s] > L || shH[s] > oRun[o]) continue;
             OPS(14, 1);
             c = trial(s, k, M, ca, cb);
-            if (c < 0) continue;
+            if (c < 0) {
+                if (trialPlaced > partR) { partR = trialPlaced; partS = s; }
+                continue;
+            }
             den = (ll)k * 2 * (shH[s] + shW[s]);
             if (bestS < 0 || c * bestDen > bestNum * den) {
                 bestS = s; bestNum = c; bestDen = den;
@@ -600,6 +641,13 @@ static int place_user(int u, int ca, int cb) {
         if (bestS >= 0) {
             for (r = 0; r < k; r++) add_rb(u, bsY[r], bsX[r], bestS);
             p->uOpt = o; p->uShape = bestS;
+            assign_done(u);
+            return 1;
+        }
+        if (MIXED && partS >= 0 && !firstShape &&
+            trial_mixed(partS, partR, k, M, oRun[o], ca, cb)) {
+            for (r = 0; r < k; r++) add_rb(u, bsY[r], bsX[r], bsS[r]);
+            p->uOpt = o; p->uShape = -1;    /* mixed shapes */
             assign_done(u);
             return 1;
         }
@@ -1200,7 +1248,7 @@ static int ruin_recreate(int x0, int x1, int y0, int y1, int maxCand, ll thr) {
             if (nX[id] + shW[nS[id]] - 1 > hi) hi = nX[id] + shW[nS[id]] - 1;
         }
         remove_user(u);
-        if (hi - lo + 1 <= spanLim) {       /* compact: placed again from scratch */
+        if (hi - lo + 1 <= spanLim || U[u].uShape < 0) {    /* placed again from scratch */
             need[u] = 0;
             if (lo < rx0) rx0 = lo;
             if (hi > rx1) rx1 = hi;
